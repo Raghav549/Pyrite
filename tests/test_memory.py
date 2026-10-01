@@ -9,3 +9,13 @@ def test_byte_budget_evicts_oldest():
     assert cache.stats.estimated_bytes <= 5
     assert "a" not in cache
     assert "c" in cache
+
+
+def test_oversized_item_fails():
+    cache = LRUResidentCache[bytes](max_items=2, max_bytes=4)
+    try:
+        cache.put("large", b"12345", 5)
+    except MemoryError:
+        pass
+    else:
+        raise AssertionError("expected MemoryError")
