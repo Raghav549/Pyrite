@@ -27,9 +27,7 @@ class ModelExecutionPlanner:
 
         for block in self.manifest.ordered_blocks():
             if block.size_bytes > self.max_unit_bytes:
-                result.append(
-                    ExecutionUnit((block.block_id,), block.size_bytes)
-                )
+                result.append(ExecutionUnit((block.block_id,), block.size_bytes))
                 current = []
                 current_bytes = 0
                 continue
@@ -52,5 +50,7 @@ class ModelExecutionPlanner:
         blocks: tuple[ModelBlock, ...],
         preferred: tuple[str, ...],
     ) -> tuple[str, ...]:
-        available = {block.block_id for block in blocks if block.kind == BlockKind.EXPERT}
+        available = {
+            block.block_id for block in blocks if block.kind == BlockKind.EXPERT
+        }
         return tuple(block_id for block_id in preferred if block_id in available)
