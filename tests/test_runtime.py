@@ -1,5 +1,6 @@
 from pyrite.config import RuntimeConfig
 from pyrite.engine import PyriteRuntime
+from pyrite.kernels.t_sar import ReferenceTernaryKernel
 
 
 def test_four_gb_budget_defaults():
@@ -20,3 +21,9 @@ def test_kv_budget():
     assert rt.kv.accept(7) == 7
     assert rt.kv.accept(7) == 3
     assert rt.kv.stats.tokens_dropped == 4
+
+
+def test_ternary_reference_kernel():
+    kernel = ReferenceTernaryKernel()
+    assert kernel.matvec([[1, 0, -1], [-1, 1, 0]], [2, 3, 4]) == [-2, 1]
+    assert kernel.estimate_bits(2, 3) == 12
