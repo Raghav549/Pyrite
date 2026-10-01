@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 
+
+@dataclass
 class ReferenceBackend:
+    """Deterministic backend for API and scheduler tests, not an LLM."""
+
     def generate(self, input_ids: list[int], max_new_tokens: int, temperature: float, top_p: float) -> list[int]:
         del temperature, top_p
         generated = list(input_ids)
@@ -9,3 +14,6 @@ class ReferenceBackend:
         for step in range(max(0, max_new_tokens)):
             generated.append((seed + step + 1) % 65536)
         return generated
+
+    def close(self) -> None:
+        return None
