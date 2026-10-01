@@ -25,8 +25,6 @@ class RuntimeStatus:
 
 
 class PyriteRuntime:
-    """Orchestration layer for memory-budgeted local inference."""
-
     def __init__(self, config: RuntimeConfig | None = None):
         self.config = config or RuntimeConfig.from_env()
         self.config.storage_dir.mkdir(parents=True, exist_ok=True)
@@ -37,8 +35,12 @@ class PyriteRuntime:
             allow_network=False,
         )
         self.policy.validate()
+
         self.store = LocalBlockStore(self.config.storage_dir)
-        self.cache = LRUResidentCache[bytes](self.config.resident_blocks)
+        self.cache = LRUResidentCache[bytes](
+            self.config.resident_blocks,
+            self.config.resident_byte_budget,
+        )
         self.router = HeuristicRouter()
         self.scheduler = BlockScheduler(
             self.config.resident_blocks,
@@ -84,11 +86,11 @@ class PyriteRuntime:
 
     def status(self) -> RuntimeStatus:
         return RuntimeStatus(
-            ram_budget_mb=self.config.ram_budget_mb,
-            working_set_mb=self.config.working_set_mb,
-            process_rss_mb=process_memory_mb(),
-            resident_blocks=self.cache.stats.resident_items,
-            cache_hits=self.cache.stats.hits,
-            cache_misses=self.cache.stats.misses,
-            offline=self.config.offline,
+            self.config.ram_budget_mb,
+            self.config.working_set_mb,
+            process_memory_mb(),
+            self.cache.stats.resident_items,
+            self.cache.stats.hits,
+            self.cache.stats.misses,
+            self.config.offline,
         )
