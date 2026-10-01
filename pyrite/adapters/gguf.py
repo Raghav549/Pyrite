@@ -12,9 +12,14 @@ class GGUFHeader:
     metadata_count: int
 
 
-class GGUFReader:
-    """Minimal GGUF header reader; tensor decoding remains backend-specific."""
+@dataclass(frozen=True)
+class GGUFMinimalTensor:
+    name: str
+    offset: int
+    size: int
 
+
+class GGUFReader:
     MAGIC = b"GGUF"
 
     def __init__(self, path: Path):
@@ -25,8 +30,21 @@ class GGUFReader:
             magic = fh.read(4)
             if magic != self.MAGIC:
                 raise ValueError("not a GGUF checkpoint")
-            raw = fh.read(8 + 8 + 8)
+            raw = fh.read(24)
             if len(raw) != 24:
                 raise ValueError("truncated GGUF header")
             version, tensor_count, metadata_count = struct.unpack("<QQQ", raw)
             return GGUFHeader(version, tensor_count, metadata_count)
+
+    def tensor_index(self) -> tuple[GGUFMinimalTensor, ...]:
+        """Return an empty-safe index contract until full GGUF metadata parsing is attached.
+
+        GGUF contains variable-length metadata and tensor descriptors. We avoid
+        guessing descriptor layouts here; a format-complete parser must decode
+        the official GGUF value types before producing real tensor offsets.
+        """
+        header = self.header()
+        return tuple(
+            GGUFMinimalTensor(name=f"tensor:{i}", offset=0, size=0)
+            for i in range(header.tensor_count)
+        )
