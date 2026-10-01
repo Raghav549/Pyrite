@@ -21,4 +21,4 @@ class WhitespaceTokenizer:
         return [abs(hash(token)) % self.spec.vocab_size for token in text.split()]
 
     def decode(self, tokens: list[int]) -> str:
-        return " ".join(str(token) for token in tokens)
+        return repr(list(tokens))
