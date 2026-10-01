@@ -1,4 +1,4 @@
-from pyrite.quant import dequantize_int8, quantize_int8
+from pyrite.quant import dequantize_int8, pack_ternary, quantize_int8, unpack_ternary
 
 
 def test_int8_roundtrip_shape():
@@ -6,3 +6,8 @@ def test_int8_roundtrip_shape():
     out = dequantize_int8(block)
     assert len(out) == 3
     assert abs(out[-1] - 2.0) < 0.02
+
+
+def test_ternary_pack_roundtrip():
+    values = [-1, 0, 1, 1, -1, 0]
+    assert unpack_ternary(pack_ternary(values), len(values)) == values
