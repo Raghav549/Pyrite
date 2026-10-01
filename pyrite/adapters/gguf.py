@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-
 from pathlib import Path
 from typing import Any
 
@@ -280,6 +279,6 @@ class GGUFReader:
 
 # Compatibility import for legacy callers.
 try:
-    from .gguf_adapter import GGUFAdapter  # noqa: E402,F401
+    from .gguf_adapter import GGUFAdapter
 except ImportError:
     GGUFAdapter = None

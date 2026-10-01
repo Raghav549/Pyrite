@@ -73,6 +73,8 @@ kernel, and decoding a 100+ GB checkpoint token-by-token on a CPU will be slow.
 
 ## Development
 
+The `dev` extra installs the optional GGUF and NumPy oracle used to check decoder parity; these are test-only and are not runtime dependencies.
+
 ```bash
 python -m pip install -e ".[dev]"
 python -m pyrite status
