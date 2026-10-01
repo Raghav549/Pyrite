@@ -1,11 +1,7 @@
 # Model adapters
 
-Model adapters are intentionally separated from the runtime scheduler. An adapter should expose model blocks or experts as independently loadable units and report:
+Model adapters expose independently loadable layers, shared blocks, or experts.
 
-- block ID and byte size
-- execution order/dependencies
-- quantization format
-- optional expert routing metadata
-- KV-cache shape/budget requirements
+An adapter should report block id, byte size, execution order, dependencies, quantization format, and optional routing metadata.
 
-Large open-weight models can therefore be stored locally in shards while the runtime keeps only a bounded working set resident.
+This allows large open-weight models to remain on local storage while Pyrite maintains a bounded in-memory working set.
