@@ -1,3 +1,4 @@
 from .reference import ReferenceBackend
+from .real import GGUFReferenceBackend
 
-__all__ = ["ReferenceBackend"]
+__all__ = ["ReferenceBackend", "GGUFReferenceBackend"]
