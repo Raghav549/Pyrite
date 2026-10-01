@@ -5,6 +5,8 @@ from pathlib import Path
 import struct
 from typing import Any
 
+from ..ggml_types import tensor_size
+
 
 @dataclass(frozen=True)
 class GGUFHeader:
@@ -104,39 +106,6 @@ class GGUFReader:
     TYPE_UINT64 = 10
     TYPE_INT64 = 11
     TYPE_FLOAT64 = 12
-
-    # GGML block formats needed to derive tensor payload size.
-    # block_size = number of logical scalar values encoded by one block.
-    _BLOCKS = {
-        0: (1, 4),       # F32
-        1: (1, 2),       # F16
-        2: (32, 18),     # Q4_0
-        3: (32, 20),     # Q4_1
-        6: (32, 22),     # Q5_0
-        7: (32, 24),     # Q5_1
-        8: (32, 34),     # Q8_0
-        9: (32, 36),     # Q8_1
-        10: (256, 84),   # Q2_K
-        11: (256, 110),  # Q3_K
-        12: (256, 144),  # Q4_K
-        13: (256, 176),  # Q5_K
-        14: (256, 210),  # Q6_K
-        15: (256, 292),  # Q8_K
-        16: (256, 66),   # IQ2_XXS
-        17: (256, 74),   # IQ2_XS
-        18: (256, 90),   # IQ3_XXS
-        19: (256, 98),   # IQ1_S
-        20: (256, 110),  # IQ4_NL
-        21: (256, 114),  # IQ3_S
-        22: (256, 50),   # IQ2_S
-        23: (256, 18),   # IQ4_XS
-        24: (256, 70),   # I8
-        25: (256, 34),   # I16
-        26: (256, 68),   # I32
-        27: (256, 136),  # I64
-        28: (256, 36),   # IQ1_M
-        29: (256, 82),   # BF16
-    }
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -279,19 +248,9 @@ class GGUFReader:
             return 0
         elements = 1
         for dim in dims:
+            if dim < 0:
+                raise ValueError("GGUF tensor dimensions cannot be negative")
             if dim == 0:
                 return 0
             elements *= dim
-
-        spec = self._BLOCKS.get(ggml_type)
-        if spec is None:
-            raise ValueError(
-                f"unsupported GGML tensor type {ggml_type}; size cannot be derived safely"
-            )
-
-        block_size, bytes_per_block = spec
-        if elements % block_size:
-            raise ValueError(
-                f"tensor element count {elements} is not divisible by block size {block_size}"
-            )
-        return (elements // block_size) * bytes_per_block
+        return tensor_size(elements, ggml_type)
