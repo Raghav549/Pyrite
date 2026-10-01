@@ -4,6 +4,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 import os
 import resource
+
 from typing import Generic, Iterator, TypeVar
 
 T = TypeVar("T")
@@ -71,7 +72,34 @@ class LRUResidentCache(Generic[T]):
 
 
 def process_memory_mb() -> float:
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    """Best-effort current RSS in MB, falling back to platform peak RSS."""
     if os.name == "nt":
-        return rss / (1024 * 1024)
-    return rss / 1024
+        try:
+            import ctypes
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.c_ulong),
+                    ("PageFaultCount", ctypes.c_ulong),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                ]
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(counters)
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+                handle, ctypes.byref(counters), counters.cb
+            )
+            if ok:
+                return counters.WorkingSetSize / (1024 * 1024)
+        except Exception:
+            pass
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except (OSError, ValueError):
+        pass
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
