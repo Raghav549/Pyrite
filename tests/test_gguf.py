@@ -37,3 +37,12 @@ def test_gguf_real_reference_backend(tmp_path: Path):
     path = _gguf(tmp_path)
     backend = GGUFReferenceBackend(path)
     assert backend.tensor("x") == [1.0, 2.0]
+
+
+def test_ggml_type_sizes_are_consistent(tmp_path: Path):
+    from pyrite.ggml_types import spec, tensor_size
+    assert spec(10).name == "Q4_K"
+    assert spec(10).block_size == 256
+    assert tensor_size(256, 10) == 144
+    assert spec(17).name == "IQ1_S"
+    assert tensor_size(256, 17) == 50
