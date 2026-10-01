@@ -10,11 +10,6 @@ class ExpertChoice:
 
 
 class ExpertRouter:
-    """Dependency-free top-k expert selector.
-
-    A trained router can replace route() while preserving this interface.
-    """
-
     def __init__(self, top_k: int = 2):
         self.top_k = max(1, top_k)
 
@@ -24,3 +19,6 @@ class ExpertRouter:
             ExpertChoice(expert_id, float(score))
             for expert_id, score in ranked[: self.top_k]
         )
+
+    def ids(self, scores: dict[str, float]) -> tuple[str, ...]:
+        return tuple(choice.expert_id for choice in self.route(scores))
