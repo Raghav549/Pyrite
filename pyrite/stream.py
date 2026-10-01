@@ -12,16 +12,27 @@ class StreamStats:
     loads: int
     prefetched: int
     cache_hits: int
+    pending: int
+    resident_bytes: int
 
 
 class BlockStreamer:
-    """Bounded async streamer for local model blocks."""
+    """Bounded async streamer with byte-based RAM accounting."""
 
-    def __init__(self, adapter: ModelAdapter, resident_blocks: int = 2, workers: int = 1):
+    def __init__(
+        self,
+        adapter: ModelAdapter,
+        resident_blocks: int = 2,
+        resident_bytes: int | None = None,
+        workers: int = 1,
+    ):
         self.adapter = adapter
         self.blocks = list(adapter.blocks())
         self.index = {block.block_id: block for block in self.blocks}
-        self.cache = LRUResidentCache[memoryview](max(1, resident_blocks))
+        self.cache = LRUResidentCache[memoryview](
+            max(1, resident_blocks),
+            resident_bytes,
+        )
         self.executor = ThreadPoolExecutor(max_workers=max(1, workers))
         self.pending: dict[str, Future[memoryview]] = {}
         self.loads = 0
@@ -45,9 +56,11 @@ class BlockStreamer:
         hit = self.cache.get(block_id)
         if hit is not None:
             return hit
+
         block = self.index.get(block_id)
         if block is None:
             raise KeyError(f"unknown block: {block_id}")
+
         future = self.pending.pop(block_id, None)
         payload = future.result() if future is not None else self._load(block)
         self.cache.put(block_id, payload, len(payload))
@@ -57,7 +70,13 @@ class BlockStreamer:
         self.executor.shutdown(wait=True, cancel_futures=True)
 
     def stats(self) -> StreamStats:
-        return StreamStats(self.loads, self.prefetched, self.cache.stats.hits)
+        return StreamStats(
+            loads=self.loads,
+            prefetched=self.prefetched,
+            cache_hits=self.cache.stats.hits,
+            pending=len(self.pending),
+            resident_bytes=self.cache.stats.estimated_bytes,
+        )
 
     def __enter__(self) -> "BlockStreamer":
         return self
