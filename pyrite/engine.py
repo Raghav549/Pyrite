@@ -19,6 +19,7 @@ class RuntimeStatus:
     working_set_mb: int
     process_rss_mb: float
     resident_blocks: int
+    resident_bytes: int
     cache_hits: int
     cache_misses: int
     offline: bool
@@ -28,11 +29,10 @@ class PyriteRuntime:
     def __init__(self, config: RuntimeConfig | None = None):
         self.config = config or RuntimeConfig.from_env()
         self.config.storage_dir.mkdir(parents=True, exist_ok=True)
+
         self.policy = DevicePolicy(
             self.config.ram_budget_mb,
             self.config.working_set_mb,
-            offline_only=self.config.offline,
-            allow_network=False,
         )
         self.policy.validate()
 
@@ -79,6 +79,11 @@ class PyriteRuntime:
         if ref is None:
             raise FileNotFoundError(f"unknown local block: {block_id}")
 
+        if ref.size_bytes > self.config.resident_byte_budget:
+            raise MemoryError(
+                f"block {block_id!r} is larger than the configured resident budget"
+            )
+
         payload = ref.path.read_bytes()
         self.cache.put(block_id, payload, len(payload))
         self.prefetch.observe(block_id)
@@ -90,6 +95,7 @@ class PyriteRuntime:
             self.config.working_set_mb,
             process_memory_mb(),
             self.cache.stats.resident_items,
+            self.cache.stats.estimated_bytes,
             self.cache.stats.hits,
             self.cache.stats.misses,
             self.config.offline,
