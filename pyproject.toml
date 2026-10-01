@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyrite-local-runtime"
+version = "0.1.0"
+description = "Privacy-first, memory-budgeted local AI runtime"
+requires-python = ">=3.10"
+
+[project.scripts]
+pyrite = "pyrite.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pyrite*"]
