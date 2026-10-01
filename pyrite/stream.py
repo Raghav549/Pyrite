@@ -14,10 +14,11 @@ class StreamStats:
     cache_hits: int
     pending: int
     resident_bytes: int
+    wasted_prefetch_bytes: int
 
 
 class BlockStreamer:
-    """Bounded async streamer with byte-based RAM accounting."""
+    """Bounded async streamer with confidence/cost-aware admission."""
 
     def __init__(
         self,
@@ -37,17 +38,28 @@ class BlockStreamer:
         self.pending: dict[str, Future[memoryview]] = {}
         self.loads = 0
         self.prefetched = 0
+        self.wasted_prefetch_bytes = 0
 
     def _load(self, block: WeightBlock) -> memoryview:
         self.loads += 1
         return self.adapter.load(block)
 
-    def prefetch(self, block_ids: list[str]) -> None:
+    def prefetch(
+        self,
+        block_ids: list[str],
+        confidence: dict[str, float] | None = None,
+        min_confidence: float = 0.0,
+    ) -> None:
+        confidence = confidence or {}
         for block_id in block_ids:
             if block_id in self.cache or block_id in self.pending:
                 continue
             block = self.index.get(block_id)
             if block is None:
+                continue
+            score = max(0.0, min(1.0, confidence.get(block_id, 1.0)))
+            if score < min_confidence:
+                self.wasted_prefetch_bytes += block.size
                 continue
             self.pending[block_id] = self.executor.submit(self._load, block)
             self.prefetched += 1
@@ -66,6 +78,12 @@ class BlockStreamer:
         self.cache.put(block_id, payload, len(payload))
         return payload
 
+    def cancel_prefetch(self, block_ids: list[str]) -> None:
+        for block_id in block_ids:
+            future = self.pending.pop(block_id, None)
+            if future is not None:
+                future.cancel()
+
     def close(self) -> None:
         self.executor.shutdown(wait=True, cancel_futures=True)
 
@@ -76,6 +94,7 @@ class BlockStreamer:
             cache_hits=self.cache.stats.hits,
             pending=len(self.pending),
             resident_bytes=self.cache.stats.estimated_bytes,
+            wasted_prefetch_bytes=self.wasted_prefetch_bytes,
         )
 
     def __enter__(self) -> "BlockStreamer":
