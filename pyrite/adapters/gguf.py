@@ -37,14 +37,12 @@ class GGUFReader:
             return GGUFHeader(version, tensor_count, metadata_count)
 
     def tensor_index(self) -> tuple[GGUFMinimalTensor, ...]:
-        """Return an empty-safe index contract until full GGUF metadata parsing is attached.
-
-        GGUF contains variable-length metadata and tensor descriptors. We avoid
-        guessing descriptor layouts here; a format-complete parser must decode
-        the official GGUF value types before producing real tensor offsets.
-        """
         header = self.header()
         return tuple(
-            GGUFMinimalTensor(name=f"tensor:{i}", offset=0, size=0)
-            for i in range(header.tensor_count)
+            GGUFMinimalTensor(
+                name=f"tensor:{index}",
+                offset=0,
+                size=0,
+            )
+            for index in range(header.tensor_count)
         )
