@@ -33,3 +33,25 @@ def test_metadata_pointing_outside_the_store_is_ignored(tmp_path: Path):
     )
     assert list(store.iter_blocks()) == []
     assert store.get("evil") is None
+
+
+def test_block_ids_with_colons_use_windows_legal_filenames(tmp_path: Path):
+    """Ids like ``layer:0001`` are valid, but ``:`` is illegal on Windows."""
+    import string
+
+    store = LocalBlockStore(tmp_path)
+    ref = store.add_bytes("layer:0001", b"payload")
+    assert ref.block_id == "layer:0001"
+    assert ref.path.read_bytes() == b"payload"
+    assert store.get("layer:0001") is not None
+
+    illegal = set('<>:"/\\|?*') | set(chr(c) for c in range(32))
+    for path in tmp_path.iterdir():
+        assert not (set(path.name) & illegal), path.name
+        assert all(c in string.printable for c in path.name)
+
+    # Distinct ids must never collide on disk.
+    store.add_bytes("layer@0001", b"other")
+    assert store.get("layer:0001").path.read_bytes() == b"payload"
+    assert store.get("layer@0001").path.read_bytes() == b"other"
+    assert store.get("layer:0001").path != store.get("layer@0001").path

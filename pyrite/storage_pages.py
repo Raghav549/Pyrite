@@ -48,6 +48,14 @@ class ContentAddressedPager:
                 index += 1
         return tuple(pages)
 
+    def verify(self, page: WeightPage) -> bool:
+        """Re-hash the stored page bytes; ``False`` means corruption or loss."""
+        try:
+            payload = page.path.read_bytes()
+        except OSError:
+            return False
+        return len(payload) == page.size and self.digest(payload) == page.sha256
+
 
 class MMapPage:
     """Small lifetime-safe mmap view over one immutable page.
@@ -58,9 +66,16 @@ class MMapPage:
     """
 
     def __init__(self, page: WeightPage):
+        if page.size <= 0:
+            raise ValueError(f"cannot mmap an empty page: {page.page_id!r}")
         self.page = page
         self._fh = page.path.open("rb")
-        self._map = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            # Length 0 maps the whole file on both POSIX and Windows.
+            self._map = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        except (OSError, ValueError) as exc:
+            self._fh.close()
+            raise ValueError(f"cannot mmap page {page.page_id!r}: {exc}") from exc
         self._views: list[memoryview] = []
 
     def view(self) -> memoryview:

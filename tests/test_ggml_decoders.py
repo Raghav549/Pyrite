@@ -21,6 +21,8 @@ import pytest
 from pyrite.ggml_types import spec, tensor_size
 from pyrite.tensor_ops import DECODABLE_TYPES, decode_vector
 
+from .k_quant import pack_q3_k_block as _pack_q3_k_reference
+
 
 def _quants():
     """The optional decoder oracle, if it is installed."""
@@ -85,45 +87,6 @@ def test_decoders_match_the_reference_library(ggml_type: int, qtype_name: str) -
 
 # --------------------------------------------------------------------- Q3_K
 _QK_K = 256
-
-
-def _pack_q3_k_reference(codes: list[int], levels: list[int], d: float) -> bytes:
-    """Port of ``quantize_row_q3_K_ref``'s packing loops.
-
-    ``codes`` are the 16 six-bit scale codes (0..63, the stored value is
-    ``code = scale + 32``) and ``levels`` the 256 three-bit quant levels (0..7).
-    """
-    assert len(codes) == 16 and len(levels) == _QK_K
-
-    scales = bytearray(12)
-    for j, code in enumerate(codes):
-        low = code & 0xF
-        if j < 8:
-            scales[j] = low
-        else:
-            scales[j - 8] |= low << 4
-        scales[j % 4 + 8] |= (code >> 4) << (2 * (j // 4))
-
-    hmask = bytearray(_QK_K // 8)
-    quants = [level - 4 if level > 3 else level for level in levels]
-    m, bit = 0, 1
-    for j in range(_QK_K):
-        if levels[j] > 3:
-            hmask[m] |= bit
-        m += 1
-        if m == _QK_K // 8:
-            m, bit = 0, bit << 1
-
-    qs = bytearray(64)
-    for j in range(0, _QK_K, 128):
-        for l in range(32):
-            qs[j // 4 + l] = (
-                quants[j + l]
-                | (quants[j + l + 32] << 2)
-                | (quants[j + l + 64] << 4)
-                | (quants[j + l + 96] << 6)
-            )
-    return bytes(hmask) + bytes(qs) + bytes(scales) + struct.pack("<e", d)
 
 
 def test_q3_k_round_trips_through_the_reference_packing() -> None:

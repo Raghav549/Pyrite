@@ -181,7 +181,7 @@ def test_k_quant_expert_slicing_is_block_aligned(tmp_path: Path):
         moe_intermediate_size=256,
         num_experts=2,
         num_experts_per_tok=2,
-        vocab_size=512,
+        vocab_size=271,
     )
     path, cfg, tensors = build_tiny_checkpoint(tmp_path / "q4k.gguf", config, ggml_type=12)
     checkpoint = Qwen3MoECheckpoint(path)
@@ -218,7 +218,7 @@ def test_forward_pass_on_a_q4_k_checkpoint(tmp_path: Path):
         moe_intermediate_size=256,
         num_experts=2,
         num_experts_per_tok=2,
-        vocab_size=512,
+        vocab_size=271,
     )
     path, cfg, _ = build_tiny_checkpoint(tmp_path / "q4k.gguf", config, ggml_type=12)
     with Qwen3MoEExecutor(path, runtime=_runtime()) as executor:
@@ -240,7 +240,7 @@ def test_unsupported_quantization_is_refused(tmp_path: Path):
         moe_intermediate_size=256,
         num_experts=2,
         num_experts_per_tok=2,
-        vocab_size=512,
+        vocab_size=271,
     )
     path, _cfg, _ = build_tiny_checkpoint(tmp_path / "unsupported.gguf", config, ggml_type=35)
     with Qwen3MoEExecutor(path, runtime=_runtime()) as executor:

@@ -98,7 +98,7 @@ def test_generate_refuses_unsupported_quantization(capsys, tmp_path: Path, monke
         moe_intermediate_size=256,
         num_experts=2,
         num_experts_per_tok=2,
-        vocab_size=512,
+        vocab_size=271,
     )
     path, _cfg, _ = build_tiny_checkpoint(tmp_path / "unsupported.gguf", config, ggml_type=35)
     code = main(["generate", str(path), "--prompt", "hello", "--max-new-tokens", "1"])
@@ -152,3 +152,24 @@ def test_bench_runs_both_modes(capsys, tmp_path: Path, monkeypatch):
     assert checkpoint["tokens_per_second"] > 0
     assert checkpoint["streamed_bytes"] > 0
     assert checkpoint["stats"]["kv_tokens"] == checkpoint["prompt_tokens"] + 2
+
+
+def test_bench_subcommand_reports_machine_info(capsys, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("PYRITE_MODEL_DIR", str(tmp_path / "store"))
+    code, payload = _run(capsys, ["bench", "--blocks", "2"])
+    assert code == 0
+    assert payload["benchmark"] == "policy"
+    assert payload["machine"]["python"]
+    assert payload["machine"]["cpu_count"] >= 1
+    assert payload["process_rss_before_mb"] >= 0.0
+
+
+def test_bench_checkpoint_reports_quantization_mix(capsys, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("PYRITE_MODEL_DIR", str(tmp_path / "store"))
+    path, _cfg, _ = build_tiny_checkpoint(tmp_path / "tiny.gguf")
+    code, payload = _run(capsys, ["bench", "--checkpoint", str(path), "--tokens", "1"])
+    assert code == 0
+    assert payload["benchmark"] == "checkpoint-generation"
+    assert payload["quantization_mix"] == {"F32": 27}
+    assert payload["checkpoint_bytes"] == path.stat().st_size
+    assert payload["new_tokens"] == 1

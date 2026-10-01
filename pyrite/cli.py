@@ -79,6 +79,22 @@ def build_parser() -> argparse.ArgumentParser:
     types = sub.add_parser("types", help="list GGML tensor types and decoder support")
     types.add_argument("--decodable-only", action="store_true")
 
+    bench = sub.add_parser("bench", help="run a reproducible runtime benchmark")
+    bench.add_argument("--prompt", default="analyze this Python API bug")
+    bench.add_argument(
+        "--blocks",
+        type=int,
+        default=16,
+        help="number of synthetic blocks for the scheduler benchmark",
+    )
+    bench.add_argument(
+        "--checkpoint",
+        help="benchmark real streaming generation on a GGUF checkpoint instead",
+    )
+    bench.add_argument("--tokens", type=int, default=8, help="tokens to generate with --checkpoint")
+    bench.add_argument("--workers", type=int, default=2)
+    bench.add_argument("--no-prefetch", action="store_true")
+
     return parser
 
 
@@ -167,6 +183,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "route":
         _print(runtime.route(args.prompt).__dict__)
         return 0
+
+    if args.command == "bench":
+        from .bench import main as bench_main
+
+        forwarded = [
+            "--prompt", args.prompt,
+            "--blocks", str(args.blocks),
+            "--tokens", str(args.tokens),
+            "--workers", str(args.workers),
+        ]
+        if args.checkpoint:
+            forwarded += ["--checkpoint", args.checkpoint]
+        if args.no_prefetch:
+            forwarded.append("--no-prefetch")
+        return bench_main(forwarded)
 
     if args.command == "types":
         entries = [
@@ -276,10 +307,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     if args.command == "generate":
-        from .executor import Qwen3MoEExecutor, UnsupportedTensorType
+        from .executor import UnsupportedTensorType, open_executor
 
         try:
-            with Qwen3MoEExecutor(
+            with open_executor(
                 args.checkpoint,
                 runtime=runtime,
                 workers=args.workers,

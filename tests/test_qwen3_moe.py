@@ -1,3 +1,5 @@
+import pytest
+
 from pyrite.qwen3_moe import Qwen3MoEConfig
 
 
@@ -22,3 +24,22 @@ def test_qwen3_moe_config_contract():
     assert cfg.num_hidden_layers == 94
     assert cfg.num_experts == 128
     assert cfg.num_experts_per_tok == 8
+
+
+def test_vocab_size_must_agree_with_the_tokenizer(tmp_path):
+    """A checkpoint whose vocab key disagrees with its tokenizer is refused."""
+    from pyrite.qwen3_moe import Qwen3MoECheckpoint, Qwen3MoEContractError
+    from tests.gguf_builder import GGUFFileBuilder
+    from tests.tiny_qwen3moe import build_tiny_checkpoint, tokenizer_vocab
+
+    path, _, _ = build_tiny_checkpoint(tmp_path / "tiny.gguf")
+    reader_meta = Qwen3MoECheckpoint(path).metadata
+    builder = GGUFFileBuilder("qwen3moe")
+    for key, value in reader_meta.items():
+        if key not in {"general.architecture", "general.alignment", "qwen3moe.vocab_size"}:
+            builder.add(key, value)
+    vocab, _, _, _, _ = tokenizer_vocab()
+    builder.add("qwen3moe.vocab_size", len(vocab) + 100)
+    bad = builder.write(tmp_path / "bad.gguf")
+    with pytest.raises(Qwen3MoEContractError, match=r"self-inconsistent checkpoint"):
+        Qwen3MoECheckpoint(bad)

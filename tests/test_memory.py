@@ -24,3 +24,25 @@ def test_oversized_item_fails():
 def test_current_rss_is_non_negative():
     from pyrite.memory import process_memory_mb
     assert process_memory_mb() >= 0
+
+
+def test_import_and_measure_without_resource_module(monkeypatch):
+    """Windows has no ``resource`` module; import and RSS must survive that."""
+    import sys
+
+    import pyrite.memory as memory
+
+    monkeypatch.setitem(sys.modules, "resource", None)
+    assert memory._rusage_peak_mb() is None
+    # On Linux the /proc fallback still measures; elsewhere it degrades to 0.0.
+    assert memory.process_memory_mb() >= 0.0
+    assert memory._peak_rss_mb() >= 0.0
+
+
+def test_rss_degrades_gracefully_when_everything_is_missing(monkeypatch):
+    import pyrite.memory as memory
+
+    monkeypatch.setattr(memory, "_proc_rss_mb", lambda: None)
+    monkeypatch.setattr(memory, "_rusage_peak_mb", lambda: None)
+    monkeypatch.setattr(memory, "_windows_working_set_mb", lambda: None)
+    assert memory.process_memory_mb() == 0.0

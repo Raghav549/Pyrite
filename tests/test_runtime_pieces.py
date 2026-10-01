@@ -154,3 +154,11 @@ def test_feedback_loop_records_measurements_in_plan_order():
     assert stats.executions == 2
     assert stats.total_io_bytes == 64 + 2048
     assert loop.scheduler.ema_io_seconds >= 0.0
+
+
+def test_mmap_page_rejects_an_empty_page(tmp_path: Path):
+    from pyrite.storage_pages import WeightPage
+
+    page = WeightPage("empty", tmp_path / "empty.page", 0, 0, "x" * 64)
+    with pytest.raises(ValueError, match="empty page"):
+        MMapPage(page)

@@ -38,6 +38,20 @@ The core runtime has no network dependency for inference and defaults to offline
 
 Applications embedding Pyrite must keep telemetry, cloud sync, and remote tools disabled when strict local-only operation is required.
 
+## Supported architectures
+
+Pyrite executes three GGUF architectures and dispatches on the file's
+`general.architecture` automatically:
+
+- `qwen3moe` — Qwen3-MoE (GQA + QK-norm attention, top-k SwiGLU experts
+  streamed as per-expert slices)
+- `qwen3` — dense decoder-only Qwen3 (same attention core, dense SwiGLU MLP)
+- `llama` — dense decoder-only Llama (GQA without QK-norm, partial rotary
+  via `rope_dimension_count`, dense SwiGLU MLP)
+
+Unknown architectures are refused with an explicit error instead of being
+mis-executed.
+
 ## Qwen3-MoE checkpoint validation
 
 Pyrite includes a strict GGUF checkpoint contract for Qwen3-MoE (`qwen3moe`), including architecture metadata parsing, expert count/top-k discovery, tensor-index validation, and bounded streaming readiness checks.
@@ -71,6 +85,18 @@ quantizations are reported and refused rather than approximated. This path is a
 correctness reference written in pure Python: it is not a throughput-optimized
 kernel, and decoding a 100+ GB checkpoint token-by-token on a CPU will be slow.
 
+## Validation
+
+`scripts/llama_crosscheck.py` cross-validates Pyrite against official
+`llama.cpp` binaries (official quantizer acceptance, exact decode parity,
+deterministic generation, and PPL agreement to ~1e-5). Measured numbers,
+greedy-parity token IDs, and the openly-unproven list live in
+`docs/validation.md`.
+
+```bash
+python scripts/llama_crosscheck.py --llama-bin /path/to/llama.cpp/build/bin
+```
+
 ## Development
 
 The `dev` extra installs the optional GGUF and NumPy oracle used to check decoder parity; these are test-only and are not runtime dependencies.
@@ -80,6 +106,6 @@ python -m pip install -e ".[dev]"
 python -m pyrite status
 python -m pyrite route "write a Python API"
 python -m pyrite.bench
-python -m ruff check pyrite tests
+python -m ruff check pyrite tests scripts
 python -m pytest
 ```
