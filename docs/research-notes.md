@@ -1,60 +1,42 @@
 # Pyrite research notes
 
-Pyrite combines several published research directions into one experimental
-runtime. These notes distinguish a research idea from an implemented feature.
+## Design lock: SSD is a cold tier
 
-## AQLM
+Pyrite does not treat SSD as equivalent to RAM. The runtime uses storage for model capacity and cold blocks, while RAM is the hot working set. Prefetch and eviction are used to hide some storage latency, but storage bandwidth remains a hard limit.
 
-AQLM uses additive/multi-codebook quantization to push language-model weight
-compression below the usual 4-bit range while preserving model behavior.
-Pyrite therefore treats quantization as a model-adapter concern rather than
-hard-coding one format.
+Research supporting this design includes HeteGen, which studies heterogeneous CPU and GPU execution with asynchronous overlap to mitigate I/O bottlenecks, and SP-MoE, which uses speculative expert prefetching, cutoff policies, asynchronous prefetch threads, and batched I/O for MoE inference.
 
-Paper: https://arxiv.org/abs/2401.06118
-
-## MoE offloading and prefetch
-
-MoE models separate total parameter capacity from the active experts used for
-a token. Recent work studies expert retention, prediction, CPU cooperation,
-and prefetching to reduce memory pressure.
-
-SPICE: https://arxiv.org/abs/2608.21240
-OLED-MoE: https://arxiv.org/abs/2609.33385
-
-Pyrite currently contains a small locality predictor and bounded cache. It is
-not yet a learned expert router.
-
-## SSD offload caveat
-
-SSD capacity solves storage capacity, not free compute. Recent analysis warns
-that repeated SSD reads can dominate energy during decode. Therefore Pyrite
-uses SSD as a cold tier and treats RAM caching and prefetch correctness as
-first-class optimization targets.
-
-Paper: https://arxiv.org/abs/2508.06978
+HeteGen: https://arxiv.org/abs/2403.01164
+SP-MoE: https://arxiv.org/abs/2510.10302
 
 ## T-SAR
 
-T-SAR explores CPU-only ternary inference through in-register SIMD lookup-table
-construction. Its reported gains come from a hardware/software co-design.
+T-SAR studies CPU-only ternary LLM inference using in-register SIMD lookup-table generation. It reports large GEMM and GEMV improvements in its hardware/software co-design. Pyrite therefore keeps ternary inference as a first-class native-kernel extension point.
 
-Paper: https://arxiv.org/abs/2511.13676
+T-SAR: https://arxiv.org/abs/2511.13676
 
-Pyrite includes a portable ternary reference interface. It deliberately does
-not claim to reproduce T-SAR hardware or performance. The next native backend
-should target common x86-64 SIMD instructions first, then optional ARM NEON.
+## KV cache
 
-## What remains to validate
+KV cache can become a dominant memory cost for long contexts. CLO studies CPU-light KV-cache offloading plus prefetching and persistent caching. Pyrite therefore has an explicit KV budget instead of allowing context growth to consume unbounded memory.
 
-A real model adapter must be benchmarked for:
-- peak RSS under the 4 GB profile
-- storage read amplification
-- tokens per second
-- first-token latency
-- cache hit rate
-- KV growth
-- quality/perplexity after quantization and sparsity
-- CPU energy per generated token
+CLO: https://arxiv.org/abs/2511.14510
 
-The 4 GB target is a measured engineering constraint, not a guarantee that
-every multi-billion-parameter model will run smoothly.
+## MoE routing and on-demand loading
+
+SP-MoE and OD-MoE motivate future learned expert prediction and just-in-time expert loading. Pyrite's current prefetch predictor is intentionally lightweight; a model-specific predictor can replace it later.
+
+OD-MoE: https://arxiv.org/abs/2512.03927
+
+## Compression and sparsity
+
+AQLM motivates aggressive low-bit weight compression. Structured and non-uniform sparsity research motivates allocating precision and pruning unevenly across layers instead of applying one global ratio.
+
+AQLM: https://arxiv.org/abs/2401.06118
+
+## Engineering rule
+
+All performance claims must come from measurements on the target device. A large model can fit on local storage while still being too slow because of compute or storage bandwidth. Pyrite therefore optimizes capacity, residency, data movement, and computation together.
+
+## Privacy
+
+Offline inference is the default. The runtime does not require a data center for model execution. Host applications must not add telemetry, cloud sync, or remote inference when strict local-only operation is required.
