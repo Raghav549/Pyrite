@@ -38,3 +38,20 @@ arXiv: https://arxiv.org/abs/2607.04206
 ## Design rule
 
 A Pyrite optimization is only accepted as a runtime truth after measurement on a real checkpoint and target device. Research results describe their evaluated systems and hardware; they do not automatically transfer to Pyrite's 4 GB target.
+
+
+## New research leads (2026)
+
+- DUAL-BLADE explores choosing a page-cache path versus direct NVMe path for KV residency under memory pressure. Pyrite remains local/offline and filesystem-based for portability, but its I/O scheduler is now structured so a direct-I/O backend can be added without changing model execution.
+  https://arxiv.org/abs/2604.26557
+
+- SpecPrefetch uses a small shared adapter only to predict candidate MoE experts while the frozen native router keeps the final routing decision. This is a useful design for Pyrite: prediction may be approximate, but execution correctness must remain authoritative.
+  https://arxiv.org/abs/2607.24787
+
+- CacheTune combines sparse KV transfer, selective recomputation, asynchronous I/O and hardware-aware recomputation ratios for non-prefix reuse. Pyrite's reusable KV layer is intentionally separated from its compression and staging layers so these can be composed and benchmarked.
+  https://arxiv.org/abs/2605.24022
+
+- Cross-model KV transfer work suggests model-family-compatible KV representations can sometimes be mapped rather than recomputed. Pyrite should only permit this behind explicit architecture fingerprints and a validation gate; cache bytes must never be interpreted across incompatible models.
+  https://arxiv.org/abs/2608.03893
+
+- Current storage-streaming measurements emphasize that random mmap/page-fault access can make effective disk bandwidth far below sequential SSD specifications. Pyrite therefore treats observed I/O latency/bytes as a first-class signal and never equates capacity with RAM.
