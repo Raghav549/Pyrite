@@ -38,6 +38,18 @@ The core runtime has no network dependency for inference and defaults to offline
 
 Applications embedding Pyrite must keep telemetry, cloud sync, and remote tools disabled when strict local-only operation is required.
 
+## Qwen3-MoE checkpoint validation
+
+Pyrite includes a strict GGUF checkpoint contract for Qwen3-MoE (`qwen3moe`), including architecture metadata parsing, expert count/top-k discovery, tensor-index validation, and bounded streaming readiness checks. It does not fake full generation when a native streaming kernel is unavailable.
+
+For the current Qwen3-235B-A22B-Instruct-2507 GGUF family, Q4_K_M is published as five split GGUF files. Merge the split files with `llama-gguf-split` before passing the resulting single GGUF path to Pyrite. The full Q4_K_M set is roughly 142 GB, while the runtime's 4 GB setting is a resident-memory budget, not a promise that the whole model fits in RAM.
+
+Validate a checkpoint locally:
+
+```bash
+python -m pyrite qwen3-check /path/to/Qwen3-235B-A22B-Q4_K_M.gguf
+```
+
 ## Development
 
 ```bash
