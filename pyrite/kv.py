@@ -11,23 +11,23 @@ class KVStats:
 
 
 class KVBudget:
-    """Simple token budget for bounded KV state.
-
-    A production backend should replace this with model-aware KV compression,
-    sink tokens, sliding windows, or quantized cache storage.
-    """
+    """Bounded token budget for a pluggable model KV-cache backend."""
 
     def __init__(self, max_tokens: int):
         self.max_tokens = max(1, max_tokens)
         self.stats = KVStats()
 
     def accept(self, new_tokens: int) -> int:
-        self.stats.tokens_seen += max(0, new_tokens)
+        new_tokens = max(0, new_tokens)
+        self.stats.tokens_seen += new_tokens
         room = max(0, self.max_tokens - self.stats.tokens_kept)
-        accepted = min(room, max(0, new_tokens))
+        accepted = min(room, new_tokens)
         self.stats.tokens_kept += accepted
-        self.stats.tokens_dropped += max(0, new_tokens - accepted)
+        self.stats.tokens_dropped += new_tokens - accepted
         return accepted
+
+    def should_truncate(self) -> bool:
+        return self.stats.tokens_kept >= self.max_tokens
 
     def reset(self) -> None:
         self.stats = KVStats()
