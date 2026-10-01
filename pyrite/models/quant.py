@@ -24,10 +24,9 @@ SUPPORTED = {
 
 def get_quantization(name: str) -> QuantizationSpec:
     key = name.strip().lower()
-    try:
-        return SUPPORTED[key]
-    except KeyError as exc:
-        raise ValueError(f"unsupported quantization: {name}") from exc
+    if key not in SUPPORTED:
+        raise ValueError(f"unsupported quantization: {name}")
+    return SUPPORTED[key]
 
 
 def estimate_weight_bytes(parameters: int, bits: int) -> int:
