@@ -276,3 +276,10 @@ class GGUFReader:
 
     def describe_type(self, ggml_type: int) -> str:
         return ggml_spec(ggml_type).name
+
+
+# Compatibility import for legacy callers.
+try:
+    from .gguf_adapter import GGUFAdapter  # noqa: E402,F401
+except ImportError:
+    GGUFAdapter = None
