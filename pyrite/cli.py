@@ -24,6 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
     inspect = sub.add_parser("inspect")
     inspect.add_argument("checkpoint")
 
+    qwen = sub.add_parser("qwen3-check")
+    qwen.add_argument("checkpoint")
+
     pages = sub.add_parser("pages")
     pages.add_argument("checkpoint")
     pages.add_argument("--page-bytes", type=int, default=2 * 1024 * 1024)
@@ -75,6 +78,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "route":
         print(json.dumps(runtime.route(args.prompt).__dict__, indent=2))
         return 0
+
+    if args.command == "qwen3-check":
+        try:
+            from .qwen3_moe import Qwen3MoECheckpoint
+            model = Qwen3MoECheckpoint(args.checkpoint)
+            print(json.dumps({
+                "model": "Qwen3-MoE",
+                "config": model.config.__dict__,
+                "routing": model.routing_summary(),
+                "streaming": model.validate_for_streaming(runtime.config.resident_byte_budget),
+            }, indent=2, default=str))
+            return 0
+        except (ValueError, KeyError, FileNotFoundError) as exc:
+            print(f"qwen3-check: {exc}", file=sys.stderr)
+            return 1
 
     if args.command == "inspect":
         try:
