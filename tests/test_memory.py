@@ -19,3 +19,8 @@ def test_oversized_item_fails():
         pass
     else:
         raise AssertionError("expected MemoryError")
+
+
+def test_current_rss_is_non_negative():
+    from pyrite.memory import process_memory_mb
+    assert process_memory_mb() >= 0
