@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .privacy import PrivacyPolicy
 
@@ -9,7 +9,7 @@ from .privacy import PrivacyPolicy
 class DevicePolicy:
     ram_budget_mb: int
     working_set_mb: int
-    privacy: PrivacyPolicy = PrivacyPolicy()
+    privacy: PrivacyPolicy = field(default_factory=PrivacyPolicy)
 
     def validate(self) -> None:
         if self.ram_budget_mb < 1024:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,6 @@ def matvec(tensor: DenseTensor, vector: Sequence[float]) -> tuple[float, ...]:
     if len(vector) != tensor.cols:
         raise ValueError("vector width does not match tensor")
     return tuple(
-        sum(weight * value for weight, value in zip(tensor.row(i), vector))
+        sum(weight * value for weight, value in zip(tensor.row(i), vector, strict=True))
         for i in range(tensor.rows)
     )

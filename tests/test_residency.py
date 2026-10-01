@@ -8,7 +8,7 @@ def test_residency_ledger_is_hard_bounded():
     assert ledger.snapshot().resident_bytes == 10
     try:
         ledger.reserve("c", 1)
-        assert False
+        raise AssertionError("reservation above budget must raise MemoryError")
     except MemoryError:
         pass
 

@@ -1,0 +1,113 @@
+"""Byte-level BPE tokenizer behaviour, on a real merge table."""
+from __future__ import annotations
+
+import pytest
+
+from pyrite.tokenizer import (
+    GGUFBPETokenizer,
+    TokenizerSpec,
+    WhitespaceTokenizer,
+    bytes_to_unicode,
+    load_gguf_tokenizer,
+)
+
+from .tiny_qwen3moe import make_test_tokenizer, tokenizer_vocab
+
+
+def test_byte_encoder_is_a_reversible_bijection():
+    encoder = bytes_to_unicode()
+    assert len(encoder) == 256
+    assert len(set(encoder.values())) == 256
+    assert all(len(char) == 1 for char in encoder.values())
+
+
+def test_merges_are_applied_by_rank():
+    tokenizer = make_test_tokenizer()
+    assert [tokenizer.tokens[i] for i in tokenizer.encode("hello")] == ["hello"]
+    assert [tokenizer.tokens[i] for i in tokenizer.encode("hello world")] == ["hello", "Ġworld"]
+
+
+def test_unknown_text_falls_back_to_bytes():
+    tokenizer = make_test_tokenizer()
+    ids = tokenizer.encode("Z")
+    assert len(ids) == 1  # a single base alphabet symbol, still decodable
+    assert tokenizer.decode(ids) == "Z"
+
+
+def test_unicode_round_trip_through_bytes():
+    tokenizer = make_test_tokenizer()
+    for text in ("hello world", "héllo wörld", "世界", "emoji 🐍 test", "line\nbreak"):
+        assert tokenizer.decode(tokenizer.encode(text)) == text
+
+
+def test_special_tokens_are_kept_whole():
+    tokenizer = make_test_tokenizer()
+    ids = tokenizer.encode("<|im_start|>hi")
+    assert tokenizer.tokens[ids[0]] == "<|im_start|>"
+    assert tokenizer.decode(ids, skip_special=False) == "<|im_start|>hi"
+    assert tokenizer.decode(ids) == "hi"
+
+
+def test_encode_with_bos():
+    tokenizer = make_test_tokenizer()
+    vocab, _, _, bos, _ = tokenizer_vocab()
+    assert tokenizer.encode("hello", add_bos=True)[0] == bos
+    assert tokenizer.spec == TokenizerSpec(vocab_size=len(vocab), bos_id=bos, eos_id=bos + 1)
+
+
+def test_byte_fallback_tokens_are_used_when_a_symbol_is_missing():
+    # A vocabulary that omits the "h" symbol must fall back to <0x68>.
+    vocab = [bytes_to_unicode()[byte] for byte in range(256) if byte != ord("h")]
+    vocab.append("<0x68>")
+    tokenizer = GGUFBPETokenizer(vocab, [])
+    ids = tokenizer.encode("h")
+    assert tokenizer.tokens[ids[0]] == "<0x68>"
+    assert tokenizer.decode(ids) == "h"
+
+
+def test_decode_rejects_out_of_range_ids():
+    tokenizer = make_test_tokenizer()
+    with pytest.raises(ValueError):
+        tokenizer.decode([10 ** 9])
+    with pytest.raises(TypeError):
+        tokenizer.encode(b"bytes are not text")
+
+
+def test_empty_vocabulary_is_rejected():
+    with pytest.raises(ValueError):
+        GGUFBPETokenizer([])
+
+
+def test_load_gguf_tokenizer_reads_metadata():
+    reader_metadata = {
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.tokens": ["a", "b", "ab"],
+        "tokenizer.ggml.merges": ["a b"],
+        "tokenizer.ggml.bos_token_id": 2,
+        "tokenizer.ggml.eos_token_id": 1,
+    }
+
+    class _Reader:
+        def metadata(self):
+            return reader_metadata
+
+    tokenizer = load_gguf_tokenizer(_Reader())
+    assert tokenizer is not None
+    assert tokenizer.bos_id == 2 and tokenizer.eos_id == 1
+    assert [tokenizer.tokens[i] for i in tokenizer.encode("ab")] == ["ab"]
+
+
+def test_load_gguf_tokenizer_returns_none_for_other_models():
+    class _Reader:
+        def metadata(self):
+            return {"tokenizer.ggml.model": "llama", "tokenizer.ggml.tokens": ["a"]}
+
+    assert load_gguf_tokenizer(_Reader()) is None
+
+
+def test_whitespace_tokenizer_is_reproducible():
+    first = WhitespaceTokenizer(TokenizerSpec(vocab_size=1024)).encode("same words here")
+    second = WhitespaceTokenizer(TokenizerSpec(vocab_size=1024)).encode("same words here")
+    assert first == second
+    assert len(first) == 3
+    assert WhitespaceTokenizer().encode("") == []

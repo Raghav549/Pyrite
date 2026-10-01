@@ -24,6 +24,6 @@ class ComputeBackend:
         if any(len(row) != width for row in matrix):
             raise ValueError("matrix rows must have equal width")
         return [
-            sum(float(w) * float(x) for w, x in zip(row, vector))
+            sum(float(w) * float(x) for w, x in zip(row, vector, strict=True))
             for row in matrix
         ]

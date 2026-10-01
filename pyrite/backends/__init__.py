@@ -1,4 +1,4 @@
+from .real import GGUFReferenceBackend, TensorPlacement
 from .reference import ReferenceBackend
-from .real import GGUFReferenceBackend
 
-__all__ = ["ReferenceBackend", "GGUFReferenceBackend"]
+__all__ = ["GGUFReferenceBackend", "ReferenceBackend", "TensorPlacement"]

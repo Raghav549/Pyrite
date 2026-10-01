@@ -1,4 +1,3 @@
-from pathlib import Path
 
 from pyrite.io_scheduler import IOComputeScheduler, IOComputeTask
 from pyrite.plan_feedback import ExecutionPlanFeedback

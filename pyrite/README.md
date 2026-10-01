@@ -12,11 +12,25 @@ Pyrite is a privacy-first local AI runtime focused on running capable open-weigh
 - Adaptive routing and prefetch scheduling.
 - KV-cache budgeting.
 - CPU-first execution, with optional accelerators.
-- Pluggable kernels, including a future T-SAR-inspired ternary CPU backend.
+- Pluggable kernels, including a portable T-SAR-inspired ternary reference kernel.
 
 ## Status
 
-The repository contains the initial runtime architecture and executable CLI scaffold. Model adapters and optimized kernels are intentionally pluggable so the runtime can evolve without coupling the scheduler to one model family.
+The package contains an executable runtime, not a scaffold:
+
+- GGUF and Safetensors adapters with a tensor index and bounded block/range reads.
+- A strict Qwen3-MoE checkpoint contract (`pyrite qwen3-check`).
+- A reference streaming executor with real quantized decoding and KV accounting.
+- A byte-level BPE tokenizer loaded from GGUF metadata.
+- Bounded caches, an I/O/compute scheduler, prefetch prediction, a content-addressed
+  local block store, and KV object codecs.
+- A CLI (`status`, `route`, `types`, `qwen3-check`, `inspect`, `pages`, `tokenize`,
+  `generate`) plus a benchmark entry point.
+
+The executor is a correctness reference: it runs real checkpoints with a bounded
+resident budget, but its CPU kernels are not throughput-optimized. Model adapters
+and kernels stay pluggable so the runtime can evolve without coupling the
+scheduler to one model family.
 
 ## Privacy
 
