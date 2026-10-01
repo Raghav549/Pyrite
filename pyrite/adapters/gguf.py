@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import struct
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -19,30 +20,278 @@ class GGUFMinimalTensor:
     size: int
 
 
+@dataclass(frozen=True)
+class GGUFTensor:
+    name: str
+    dims: tuple[int, ...]
+    ggml_type: int
+    offset: int
+    size: int
+
+    @property
+    def end(self) -> int:
+        return self.offset + self.size
+
+
+class _Reader:
+    def __init__(self, fh):
+        self.fh = fh
+
+    def u8(self) -> int:
+        return struct.unpack("<B", self._read(1))[0]
+
+    def i8(self) -> int:
+        return struct.unpack("<b", self._read(1))[0]
+
+    def u16(self) -> int:
+        return struct.unpack("<H", self._read(2))[0]
+
+    def i16(self) -> int:
+        return struct.unpack("<h", self._read(2))[0]
+
+    def u32(self) -> int:
+        return struct.unpack("<I", self._read(4))[0]
+
+    def i32(self) -> int:
+        return struct.unpack("<i", self._read(4))[0]
+
+    def u64(self) -> int:
+        return struct.unpack("<Q", self._read(8))[0]
+
+    def i64(self) -> int:
+        return struct.unpack("<q", self._read(8))[0]
+
+    def f32(self) -> float:
+        return struct.unpack("<f", self._read(4))[0]
+
+    def f64(self) -> float:
+        return struct.unpack("<d", self._read(8))[0]
+
+    def raw(self, size: int) -> bytes:
+        return self._read(size)
+
+    def string(self) -> str:
+        size = self.u64()
+        if size > 1024 * 1024:
+            raise ValueError("GGUF string exceeds safety limit")
+        raw = self._read(size)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid UTF-8 string in GGUF") from exc
+
+    def _read(self, size: int) -> bytes:
+        data = self.fh.read(size)
+        if len(data) != size:
+            raise ValueError("truncated GGUF checkpoint")
+        return data
+
+
 class GGUFReader:
     MAGIC = b"GGUF"
+    DEFAULT_ALIGNMENT = 32
+
+    TYPE_UINT8 = 0
+    TYPE_INT8 = 1
+    TYPE_UINT16 = 2
+    TYPE_INT16 = 3
+    TYPE_UINT32 = 4
+    TYPE_INT32 = 5
+    TYPE_FLOAT32 = 6
+    TYPE_BOOL = 7
+    TYPE_STRING = 8
+    TYPE_ARRAY = 9
+    TYPE_UINT64 = 10
+    TYPE_INT64 = 11
+    TYPE_FLOAT64 = 12
+
+    # GGML block formats needed to derive tensor payload size.
+    # block_size = number of logical scalar values encoded by one block.
+    _BLOCKS = {
+        0: (1, 4),       # F32
+        1: (1, 2),       # F16
+        2: (32, 18),     # Q4_0
+        3: (32, 20),     # Q4_1
+        6: (32, 22),     # Q5_0
+        7: (32, 24),     # Q5_1
+        8: (32, 34),     # Q8_0
+        9: (32, 36),     # Q8_1
+        10: (256, 84),   # Q2_K
+        11: (256, 110),  # Q3_K
+        12: (256, 144),  # Q4_K
+        13: (256, 176),  # Q5_K
+        14: (256, 210),  # Q6_K
+        15: (256, 292),  # Q8_K
+        16: (256, 66),   # IQ2_XXS
+        17: (256, 74),   # IQ2_XS
+        18: (256, 90),   # IQ3_XXS
+        19: (256, 98),   # IQ1_S
+        20: (256, 110),  # IQ4_NL
+        21: (256, 114),  # IQ3_S
+        22: (256, 50),   # IQ2_S
+        23: (256, 18),   # IQ4_XS
+        24: (256, 70),   # I8
+        25: (256, 34),   # I16
+        26: (256, 68),   # I32
+        27: (256, 136),  # I64
+        28: (256, 36),   # IQ1_M
+        29: (256, 82),   # BF16
+    }
 
     def __init__(self, path: Path):
-        self.path = path
+        self.path = Path(path)
+        self._parsed = False
+        self._header: GGUFHeader | None = None
+        self._metadata: dict[str, Any] = {}
+        self._tensors: tuple[GGUFTensor, ...] = ()
+        self._data_offset = 0
 
     def header(self) -> GGUFHeader:
-        with self.path.open("rb") as fh:
-            magic = fh.read(4)
-            if magic != self.MAGIC:
-                raise ValueError("not a GGUF checkpoint")
-            raw = fh.read(24)
-            if len(raw) != 24:
-                raise ValueError("truncated GGUF header")
-            version, tensor_count, metadata_count = struct.unpack("<QQQ", raw)
-            return GGUFHeader(version, tensor_count, metadata_count)
+        self._ensure_parsed()
+        assert self._header is not None
+        return self._header
 
-    def tensor_index(self) -> tuple[GGUFMinimalTensor, ...]:
-        header = self.header()
-        return tuple(
-            GGUFMinimalTensor(
-                name=f"tensor:{index}",
-                offset=0,
-                size=0,
+    def metadata(self) -> dict[str, Any]:
+        self._ensure_parsed()
+        return dict(self._metadata)
+
+    def tensor_index(self) -> tuple[GGUFTensor, ...]:
+        self._ensure_parsed()
+        return self._tensors
+
+    @property
+    def tensor_data_offset(self) -> int:
+        self._ensure_parsed()
+        return self._data_offset
+
+    def read_tensor(self, tensor: GGUFTensor) -> bytes:
+        self._ensure_parsed()
+        with self.path.open("rb") as fh:
+            fh.seek(tensor.offset)
+            data = fh.read(tensor.size)
+        if len(data) != tensor.size:
+            raise ValueError(f"truncated tensor payload: {tensor.name}")
+        return data
+
+    def _ensure_parsed(self) -> None:
+        if self._parsed:
+            return
+        if not self.path.is_file():
+            raise FileNotFoundError(self.path)
+
+        with self.path.open("rb") as fh:
+            r = _Reader(fh)
+            if r.raw(4) != self.MAGIC:
+                raise ValueError("not a GGUF checkpoint")
+
+            version = r.u32()
+            if version < 1 or version > 3:
+                raise ValueError(f"unsupported GGUF version: {version}")
+
+            tensor_count = r.u64()
+            metadata_count = r.u64()
+            if tensor_count > 10_000_000 or metadata_count > 1_000_000:
+                raise ValueError("GGUF counts exceed safety limits")
+
+            metadata: dict[str, Any] = {}
+            alignment = self.DEFAULT_ALIGNMENT
+
+            for _ in range(metadata_count):
+                key = r.string()
+                value_type = r.u32()
+                value = self._read_value(r, value_type)
+                metadata[key] = value
+                if key == "general.alignment" and isinstance(value, int) and value > 0:
+                    alignment = value
+
+            descriptors: list[tuple[str, tuple[int, ...], int, int]] = []
+            for _ in range(tensor_count):
+                name = r.string()
+                n_dims = r.u32()
+                if n_dims > 8:
+                    raise ValueError("GGUF tensor has too many dimensions")
+                dims = tuple(r.u64() for _ in range(n_dims))
+                ggml_type = r.u32()
+                relative_offset = r.u64()
+                descriptors.append((name, dims, ggml_type, relative_offset))
+
+            position = fh.tell()
+            if tensor_count:
+                data_offset = position + (alignment - (position % alignment)) % alignment
+            else:
+                data_offset = position
+
+            tensors: list[GGUFTensor] = []
+            for index, (name, dims, ggml_type, relative_offset) in enumerate(descriptors):
+                if alignment <= 0 or relative_offset % alignment != 0:
+                    raise ValueError(f"unaligned GGUF tensor offset: {name}")
+                size = self._tensor_size(dims, ggml_type)
+                absolute = data_offset + relative_offset
+                if absolute + size > self.path.stat().st_size:
+                    raise ValueError(f"GGUF tensor extends beyond file: {name}")
+                if index + 1 < len(descriptors):
+                    next_absolute = data_offset + descriptors[index + 1][3]
+                    if next_absolute < absolute:
+                        raise ValueError("GGUF tensor offsets are not monotonic")
+                tensors.append(GGUFTensor(name, dims, ggml_type, absolute, size))
+
+        self._header = GGUFHeader(version, tensor_count, metadata_count)
+        self._metadata = metadata
+        self._tensors = tuple(tensors)
+        self._data_offset = data_offset
+        self._parsed = True
+
+    def _read_value(self, r: _Reader, value_type: int) -> Any:
+        if value_type == self.TYPE_UINT8:
+            return r.u8()
+        if value_type == self.TYPE_INT8:
+            return r.i8()
+        if value_type == self.TYPE_UINT16:
+            return r.u16()
+        if value_type == self.TYPE_INT16:
+            return r.i16()
+        if value_type == self.TYPE_UINT32:
+            return r.u32()
+        if value_type == self.TYPE_INT32:
+            return r.i32()
+        if value_type == self.TYPE_FLOAT32:
+            return r.f32()
+        if value_type == self.TYPE_BOOL:
+            return bool(r.u8())
+        if value_type == self.TYPE_STRING:
+            return r.string()
+        if value_type == self.TYPE_ARRAY:
+            element_type = r.u32()
+            count = r.u64()
+            if count > 10_000_000:
+                raise ValueError("GGUF metadata array exceeds safety limit")
+            return tuple(self._read_value(r, element_type) for _ in range(count))
+        if value_type == self.TYPE_UINT64:
+            return r.u64()
+        if value_type == self.TYPE_INT64:
+            return r.i64()
+        if value_type == self.TYPE_FLOAT64:
+            return r.f64()
+        raise ValueError(f"unsupported GGUF metadata type: {value_type}")
+
+    def _tensor_size(self, dims: tuple[int, ...], ggml_type: int) -> int:
+        if not dims:
+            return 0
+        elements = 1
+        for dim in dims:
+            if dim == 0:
+                return 0
+            elements *= dim
+
+        spec = self._BLOCKS.get(ggml_type)
+        if spec is None:
+            raise ValueError(
+                f"unsupported GGML tensor type {ggml_type}; size cannot be derived safely"
             )
-            for index in range(header.tensor_count)
-        )
+
+        block_size, bytes_per_block = spec
+        if elements % block_size:
+            raise ValueError(
+                f"tensor element count {elements} is not divisible by block size {block_size}"
+            )
+        return (elements // block_size) * bytes_per_block
