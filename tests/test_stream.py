@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from pyrite.adapters.raw_shards import RawShardAdapter
 from pyrite.stream import BlockStreamer
 
@@ -13,8 +15,9 @@ def test_streamer_prefetch_and_cache(tmp_path: Path):
         stream.prefetch(["a", "b"])
         assert bytes(stream.get("a")) == b"aaa"
         assert bytes(stream.get("a")) == b"aaa"
-        assert stream.get("missing") if False else True
         stats = stream.stats()
+        with pytest.raises(KeyError):
+            stream.get("missing")
 
     assert stats.prefetched == 2
     assert stats.loads == 2
