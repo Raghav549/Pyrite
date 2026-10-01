@@ -1,0 +1,10 @@
+{
+  "name": "pyrite-4gb-profile",
+  "ram_budget_mb": 4096,
+  "reserve_mb": 768,
+  "max_context_tokens": 2048,
+  "max_kv_tokens": 1536,
+  "resident_blocks": 2,
+  "prefetch_depth": 2,
+  "offline": true
+}
