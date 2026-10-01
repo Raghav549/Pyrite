@@ -63,8 +63,9 @@ class AdaptiveKVCache:
         return token
 
     def evict_low_importance(self, required_bytes: int) -> None:
-        del required_bytes
-        while self.tokens and self.stats.estimated_bytes > max(0, self.max_bytes - 1):
+        if required_bytes < 0:
+            raise ValueError("required_bytes must be non-negative")
+        while self.tokens and self.stats.estimated_bytes + required_bytes > self.max_bytes:
             victim = min(self.tokens, key=lambda item: item.importance)
             self.tokens.remove(victim)
             self.stats.estimated_bytes -= self.token_bytes(victim.precision_bits)
