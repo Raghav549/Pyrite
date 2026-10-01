@@ -20,6 +20,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 
 from .adapters.gguf_adapter import GGUFAdapter
 from .config import RuntimeConfig
@@ -52,6 +53,9 @@ class ExecutorStats:
     kv_bytes: int = 0
     kv_budget_bytes: int = 0
     bytes_loaded: int = 0
+    prefetch_hits: int = 0
+    io_seconds: float = 0.0
+    decode_seconds: float = 0.0
 
     def to_dict(self) -> dict[str, int]:
         return dict(self.__dict__)
@@ -93,6 +97,9 @@ class _NoTokenizer:
 class Qwen3MoEExecutor:
     """Real, bounded Qwen3-MoE inference over a GGUF checkpoint."""
 
+    #: Checkpoint contract validated at startup; dense subclasses override this.
+    CHECKPOINT_CLS = Qwen3MoECheckpoint
+
     #: Rows of the vocabulary projection streamed per read.
     OUTPUT_CHUNK_ROWS = 128
 
@@ -123,7 +130,7 @@ class Qwen3MoEExecutor:
     ):
         self.runtime = runtime or PyriteRuntime(config)
         self.path = Path(path)
-        self.checkpoint = Qwen3MoECheckpoint(self.path)
+        self.checkpoint = self.CHECKPOINT_CLS(self.path)
         self.checkpoint.validate_contract()
         self.adapter = GGUFAdapter(self.path)
         self.prefetch_enabled = prefetch
@@ -246,14 +253,22 @@ class Qwen3MoEExecutor:
         if self._cache_small_tensors and name in self._small:
             return self._small[name]
         tensor = self.checkpoint.tensor(name)
-        values = decode_vector(tensor.ggml_type, self._block_bytes(name), tensor.element_count)
+        values = self._decode(tensor.ggml_type, self._block_bytes(name), tensor.element_count)
         if self._cache_small_tensors and tensor.size <= max(64 * 1024, self.max_tensor_bytes // 16):
             self._small[name] = values
         return values
 
     def _tensor_vector(self, name: str) -> list[float]:
         tensor = self.checkpoint.tensor(name)
-        return decode_vector(tensor.ggml_type, self._block_bytes(name), tensor.element_count)
+        return self._decode(tensor.ggml_type, self._block_bytes(name), tensor.element_count)
+
+    def _decode(self, ggml_type: int, payload: bytes, count: int) -> list[float]:
+        """Decode one tensor payload, timing it for the I/O/decode breakdown."""
+        started = perf_counter()
+        try:
+            return decode_vector(ggml_type, payload, count)
+        finally:
+            self.stats.decode_seconds += perf_counter() - started
 
     def _row_bytes(self, name: str, first_element: int, element_count: int) -> tuple[int, int]:
         """Byte range covering a block-aligned element range of a tensor."""
@@ -282,7 +297,7 @@ class Qwen3MoEExecutor:
         self.stats.tensors_streamed += 1
         payload = bytes(self.streamer.get_range(f"tensor:{name}", byte_offset, byte_length))
         self._after_load()
-        values = decode_vector(tensor.ggml_type, payload, row_count * cols)
+        values = self._decode(tensor.ggml_type, payload, row_count * cols)
         return [values[row * cols:(row + 1) * cols] for row in range(row_count)]
 
     def _slice_vector(self, layer: int, expert: int, component: str) -> list[float]:
@@ -294,7 +309,7 @@ class Qwen3MoEExecutor:
             self.streamer.get_range(slice_.block_id, slice_.block_offset, slice_.byte_length)
         )
         self._after_load()
-        return decode_vector(slice_.ggml_type, payload, slice_.element_count)
+        return self._decode(slice_.ggml_type, payload, slice_.element_count)
 
     def _after_load(self) -> None:
         resident = self.streamer.cache.stats.estimated_bytes
@@ -305,6 +320,8 @@ class Qwen3MoEExecutor:
         self.stats.prefetched = self.streamer.prefetched
         self.stats.wasted_prefetch_bytes = self.streamer.wasted_prefetch_bytes
         self.stats.bytes_loaded = self.streamer.bytes_loaded
+        self.stats.prefetch_hits = self.streamer.prefetch_hits
+        self.stats.io_seconds = self.streamer.io_seconds
 
     # ------------------------------------------------------------------- math
     @staticmethod
@@ -333,9 +350,15 @@ class Qwen3MoEExecutor:
         return [value * inv * w for value, w in zip(x, weight, strict=True)]
 
     @staticmethod
-    def _rope(vector: list[float], position: int, theta: float) -> list[float]:
-        """NEOX-style RoPE over the whole head dimension (llama.cpp qwen3 style)."""
-        n_rot = len(vector)
+    def _rope(
+        vector: list[float], position: int, theta: float, rotary_dim: int | None = None
+    ) -> list[float]:
+        """NEOX-style RoPE (llama.cpp style).
+
+        The whole head rotates unless ``rotary_dim`` is smaller, in which case
+        only the first ``rotary_dim`` values rotate and the rest pass through.
+        """
+        n_rot = len(vector) if rotary_dim is None else min(rotary_dim, len(vector))
         half = n_rot // 2
         for i in range(half):
             freq = theta ** (-2.0 * i / n_rot)
@@ -387,15 +410,25 @@ class Qwen3MoEExecutor:
         k = self._matvec(self._tensor_vector(f"blk.{layer}.attn_k.weight"), cfg.kv_proj_dim, cfg.hidden_size, hidden)
         v = self._matvec(self._tensor_vector(f"blk.{layer}.attn_v.weight"), cfg.kv_proj_dim, cfg.hidden_size, hidden)
 
-        q_norm = self._dense_vector(f"blk.{layer}.attn_q_norm.weight")
-        k_norm = self._dense_vector(f"blk.{layer}.attn_k_norm.weight")
+        # QK-norm exists on Qwen3(-MoE) but not on Llama; apply it only when
+        # the checkpoint carries the tensors.
+        q_norm_name = f"blk.{layer}.attn_q_norm.weight"
+        k_norm_name = f"blk.{layer}.attn_k_norm.weight"
+        q_norm = self._dense_vector(q_norm_name) if self.checkpoint.has_tensor(q_norm_name) else None
+        k_norm = self._dense_vector(k_norm_name) if self.checkpoint.has_tensor(k_norm_name) else None
+        rotary_dim = getattr(cfg, "rotary_dim", head_dim) or head_dim
+
+        def _prep_head(vec: list[float], norm: list[float] | None) -> list[float]:
+            if norm is not None:
+                vec = self._rms_norm(vec, norm, cfg.rms_norm_eps)
+            return self._rope(vec, position, cfg.rope_theta, rotary_dim)
 
         q_heads = [
-            self._rope(self._rms_norm(q[h * head_dim:(h + 1) * head_dim], q_norm, cfg.rms_norm_eps), position, cfg.rope_theta)
+            _prep_head(q[h * head_dim:(h + 1) * head_dim], q_norm)
             for h in range(cfg.num_attention_heads)
         ]
         k_heads = [
-            self._rope(self._rms_norm(k[h * head_dim:(h + 1) * head_dim], k_norm, cfg.rms_norm_eps), position, cfg.rope_theta)
+            _prep_head(k[h * head_dim:(h + 1) * head_dim], k_norm)
             for h in range(cfg.num_key_value_heads)
         ]
         v_heads = [v[h * head_dim:(h + 1) * head_dim] for h in range(cfg.num_key_value_heads)]
@@ -603,3 +636,36 @@ class Qwen3MoEExecutor:
             "unsupported_tensor_types": list(self.unsupported_tensor_types()),
             "tokenizer": type(self.tokenizer).__name__,
         }
+
+
+def detect_architecture(path: str | Path) -> str:
+    """Read ``general.architecture`` from a GGUF checkpoint."""
+    from .adapters.gguf import GGUFReader
+
+    reader = GGUFReader(Path(path))
+    return str(reader.metadata().get("general.architecture", ""))
+
+
+def open_executor(
+    path: str | Path,
+    runtime: PyriteRuntime | None = None,
+    config: RuntimeConfig | None = None,
+    **kwargs,
+) -> Qwen3MoEExecutor:
+    """Open the streaming executor matching the checkpoint architecture.
+
+    ``qwen3moe`` checkpoints use the MoE executor; ``qwen3`` and ``llama``
+    checkpoints use the dense executor.  Anything else raises a clear error
+    instead of running the wrong architecture.
+    """
+    arch = detect_architecture(path)
+    if arch == "qwen3moe":
+        return Qwen3MoEExecutor(path, runtime=runtime, config=config, **kwargs)
+    if arch in ("qwen3", "llama"):
+        from .dense import DenseExecutor
+
+        return DenseExecutor(path, runtime=runtime, config=config, **kwargs)
+    raise ValueError(
+        f"unsupported GGUF architecture {arch or 'unknown'!r}: "
+        "Pyrite executes qwen3moe, qwen3 and llama checkpoints"
+    )

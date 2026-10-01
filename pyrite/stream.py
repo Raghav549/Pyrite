@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 from .adapters.base import ModelAdapter, WeightBlock
 from .memory import LRUResidentCache
@@ -13,6 +14,7 @@ from .memory import LRUResidentCache
 class StreamStats:
     loads: int
     prefetched: int
+    prefetch_hits: int
     cache_hits: int
     pending: int
     resident_bytes: int
@@ -20,6 +22,7 @@ class StreamStats:
     wasted_prefetch_bytes: int
     uncached_bytes: int
     bytes_loaded: int
+    io_seconds: float
 
 
 class BlockStreamer:
@@ -60,9 +63,11 @@ class BlockStreamer:
         self.pending_bytes = 0
         self.loads = 0
         self.prefetched = 0
+        self.prefetch_hits = 0
         self.wasted_prefetch_bytes = 0
         self.uncached_bytes = 0
         self.bytes_loaded = 0
+        self.io_seconds = 0.0
         self._closed = False
 
     # ------------------------------------------------------------------ loading
@@ -71,9 +76,11 @@ class BlockStreamer:
         if byte_offset < 0 or length < 0 or byte_offset + length > block.size:
             raise ValueError(f"range [{byte_offset}, {byte_offset + length}) is outside {block.block_id}")
         self.loads += 1
+        started = perf_counter()
         with Path(block.path).open("rb") as fh:
             fh.seek(block.offset + byte_offset)
             payload = fh.read(length)
+        self.io_seconds += perf_counter() - started
         if len(payload) != length:
             raise ValueError(f"truncated block read: {block.block_id}")
         self.bytes_loaded += length
@@ -157,14 +164,29 @@ class BlockStreamer:
         if block is None:
             raise KeyError(f"unknown block: {block_id}")
         future = self._take_pending(block_id)
+        if future is not None:
+            self.prefetch_hits += 1
         payload = future.result() if future is not None else self._load(block)
         self._maybe_cache(block_id, payload)
         return payload
 
     def get_range(self, block_id: str, byte_offset: int, byte_length: int) -> memoryview:
-        """Load (or reuse) an exact byte range of ``block_id``."""
+        """Load (or reuse) a byte range of ``block_id``.
+
+        Ranges starting at offset 0 resolve to the cached whole block (which
+        callers slice); every other range is cached under its own key.  A
+        range reaching past the end of the block is always rejected rather
+        than silently truncated.
+        """
         if byte_length < 0 or byte_offset < 0:
             raise ValueError("range offsets must be non-negative")
+        block = self.index.get(block_id)
+        if block is None:
+            raise KeyError(f"unknown block: {block_id}")
+        if byte_offset + byte_length > block.size:
+            raise ValueError(
+                f"range [{byte_offset}, {byte_offset + byte_length}) is outside {block_id}"
+            )
         key = self._range_id(block_id, byte_offset, byte_length)
         if key != block_id:
             hit = self.cache.get(key)
@@ -173,10 +195,9 @@ class BlockStreamer:
         else:
             return self.get(block_id)
 
-        block = self.index.get(block_id)
-        if block is None:
-            raise KeyError(f"unknown block: {block_id}")
         future = self._take_pending(key)
+        if future is not None:
+            self.prefetch_hits += 1
         payload = future.result() if future is not None else self._load(block, byte_offset, byte_length)
         self._maybe_cache(key, payload)
         return payload
@@ -205,6 +226,7 @@ class BlockStreamer:
         return StreamStats(
             loads=self.loads,
             prefetched=self.prefetched,
+            prefetch_hits=self.prefetch_hits,
             cache_hits=self.cache.stats.hits,
             pending=len(self.pending),
             resident_bytes=self.cache.stats.estimated_bytes + self.pending_bytes,
@@ -212,6 +234,7 @@ class BlockStreamer:
             wasted_prefetch_bytes=self.wasted_prefetch_bytes,
             uncached_bytes=self.uncached_bytes,
             bytes_loaded=self.bytes_loaded,
+            io_seconds=self.io_seconds,
         )
 
     def __enter__(self) -> BlockStreamer:

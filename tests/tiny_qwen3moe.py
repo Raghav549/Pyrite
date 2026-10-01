@@ -13,7 +13,7 @@ from pathlib import Path
 from pyrite.ggml_types import tensor_size
 from pyrite.tokenizer import bytes_to_unicode
 
-from .gguf_builder import GGUFFileBuilder, f32_bytes
+from .gguf_builder import INT32, GGUFFileBuilder, f32_bytes
 
 
 @dataclass(frozen=True)
@@ -77,12 +77,23 @@ def tokenizer_vocab() -> tuple[list[str], list[str], list[int], int, int]:
     return vocab, list(MERGES), token_types, bos, eos
 
 
-def build_tokenizer_metadata(builder: GGUFFileBuilder) -> None:
+def build_tokenizer_metadata(builder: GGUFFileBuilder, vocab_size: int | None = None) -> None:
     vocab, merges, token_types, bos, eos = tokenizer_vocab()
+    if vocab_size is not None and vocab_size > len(vocab):
+        # Pad with reserved normal tokens so the declared vocabulary matches
+        # embedding/output rows on larger-than-tiny fixtures.  llama.cpp
+        # derives the expected vocab from this list and refuses mismatches.
+        extra = vocab_size - len(vocab)
+        vocab = vocab + [f"<reserved_{i}>" for i in range(extra)]
+        token_types = token_types + [1] * extra
+    elif vocab_size is not None and vocab_size != len(vocab):
+        raise ValueError(f"cannot shrink the fixture vocabulary to {vocab_size}")
     builder.add("tokenizer.ggml.model", "gpt2")
+    builder.add("tokenizer.ggml.pre", "qwen2")
     builder.add("tokenizer.ggml.tokens", vocab)
     builder.add("tokenizer.ggml.merges", merges)
-    builder.add("tokenizer.ggml.token_type", token_types)
+    # Real GGUFs store token types as int32; llama.cpp refuses uint32 here.
+    builder.add("tokenizer.ggml.token_type", token_types, INT32)
     builder.add("tokenizer.ggml.bos_token_id", bos)
     builder.add("tokenizer.ggml.eos_token_id", eos)
 

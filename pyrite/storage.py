@@ -11,6 +11,24 @@ from pathlib import Path
 #: Block ids become file names, so they must not be able to escape the store.
 _SAFE_BLOCK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$")
 
+#: Characters that are legal in a block id but illegal (or reserved) in file
+#: names on Windows.  ``:`` for example appears in ids such as ``layer:0001``
+#: but cannot appear in a Windows file name.
+_FILENAME_ESCAPES = {
+    ":": "%3A",
+    "@": "%40",
+    "%": "%25",
+}
+
+#: Windows device names that cannot be used as a file stem.
+_RESERVED_STEMS = frozenset(
+    {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
+
 
 @dataclass(frozen=True)
 class BlockRef:
@@ -37,9 +55,23 @@ class LocalBlockStore:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _file_stem(block_id: str) -> str:
+        """Map a block id to a file stem that is legal on every platform.
+
+        The mapping is deterministic and injective over validated block ids, so
+        distinct ids never share a file.  Only the on-disk spelling changes;
+        :class:`BlockRef` keeps the original id.
+        """
+        stem = "".join(_FILENAME_ESCAPES.get(char, char) for char in block_id)
+        if stem.upper() in _RESERVED_STEMS:
+            stem = f"_{stem}"
+        return stem
+
     def _paths(self, block_id: str) -> tuple[Path, Path]:
         validate_block_id(block_id)
-        return self.root / f"{block_id}.bin", self.root / f"{block_id}.json"
+        stem = self._file_stem(block_id)
+        return self.root / f"{stem}.bin", self.root / f"{stem}.json"
 
     def _write_meta(self, ref: BlockRef) -> None:
         _, meta_path = self._paths(ref.block_id)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import resource
 import sys
 from collections import OrderedDict
 from collections.abc import Iterator
@@ -91,48 +90,109 @@ class LRUResidentCache(Generic[T]):
         return iter(self._data.keys())
 
 
-def process_memory_mb() -> float:
-    """Best-effort current RSS in MB, falling back to platform peak RSS."""
-    if os.name == "nt":
-        # The Win32 route is best effort: any failure falls back to the
-        # standard-library peak RSS value.
-        with suppress(AttributeError, OSError, TypeError, ValueError):
-            import ctypes
+def _windows_working_set_mb() -> float | None:
+    """Current process working set in MB via the Win32 API.
 
-            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
-                _fields_ = [
-                    ("cb", ctypes.c_ulong),
-                    ("PageFaultCount", ctypes.c_ulong),
-                    ("PeakWorkingSetSize", ctypes.c_size_t),
-                    ("WorkingSetSize", ctypes.c_size_t),
-                ]
+    Returns ``None`` when the measurement is unavailable instead of raising,
+    so callers can fall back to another source.  ``ctypes.windll`` only exists
+    on Windows; this function is never called on other platforms.
+    """
+    with suppress(AttributeError, OSError, TypeError, ValueError):
+        import ctypes
 
-            counters = PROCESS_MEMORY_COUNTERS()
-            counters.cb = ctypes.sizeof(counters)
-            handle = ctypes.windll.kernel32.GetCurrentProcess()
-            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
-                handle, ctypes.byref(counters), counters.cb
-            )
-            if ok:
-                return counters.WorkingSetSize / (1024 * 1024)
-        return _peak_rss_mb()
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            # Full Win32 PROCESS_MEMORY_COUNTERS layout (10 fields).  Passing
+            # a truncated struct can make GetProcessMemoryInfo fail, because
+            # the API validates ``cb`` against the expected size.
+            _fields_ = [
+                ("cb", ctypes.c_ulong),
+                ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
 
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(counters)
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+            handle, ctypes.byref(counters), counters.cb
+        )
+        if ok:
+            return counters.WorkingSetSize / (1024 * 1024)
+    return None
+
+
+def _proc_rss_mb() -> float | None:
+    """Current RSS in MB from ``/proc`` (Linux), or ``None`` if unreadable."""
     try:
         with open("/proc/self/status", encoding="utf-8") as fh:
             for line in fh:
                 if line.startswith("VmRSS:"):
                     return float(line.split()[1]) / 1024.0
     except (OSError, ValueError):
-        pass
-    return _peak_rss_mb()
+        return None
+    return None
+
+
+def _rusage_peak_mb() -> float | None:
+    """Peak RSS in MB via ``resource`` (Unix only), or ``None`` if unavailable.
+
+    The ``resource`` module does not exist on Windows, so it is imported lazily
+    and its absence is not an error.  ``ru_maxrss`` is reported in kilobytes
+    on Linux and in bytes on macOS.
+    """
+    try:
+        import resource
+    except ImportError:
+        return None
+    with suppress(OSError, ValueError, AttributeError):
+        raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return raw / (1024 * 1024)
+        return raw / 1024.0
+    return None
+
+
+def process_memory_mb() -> float:
+    """Best-effort current resident memory of this process, in MB.
+
+    Measurement sources, in order of preference:
+
+    * Windows: Win32 working set (``GetProcessMemoryInfo``);
+    * Linux: ``/proc/self/status`` ``VmRSS``;
+    * any Unix: ``resource.getrusage`` peak RSS (Linux/macOS fallback).
+
+    Returns ``0.0`` when no source is available (for example a sandboxed
+    interpreter without ``/proc`` or ``resource``); ``0.0`` therefore means
+    "unknown", never "no memory used".  This function never raises for a
+    measurement failure: memory *accounting* raises (see
+    :class:`LRUResidentCache`), memory *observation* degrades gracefully.
+    """
+    if os.name == "nt":
+        measured = _windows_working_set_mb()
+        if measured is not None:
+            return measured
+        return _rusage_peak_mb() or 0.0
+
+    measured = _proc_rss_mb()
+    if measured is not None:
+        return measured
+    return _rusage_peak_mb() or 0.0
 
 
 def _peak_rss_mb() -> float:
     """Peak RSS in MB, normalized across platforms.
 
-    ``ru_maxrss`` is reported in kilobytes on Linux and in bytes on macOS.
+    Kept for backwards compatibility; prefers the Unix ``resource`` peak and
+    otherwise falls back to whatever :func:`process_memory_mb` can measure.
     """
-    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform == "darwin":
-        return raw / (1024 * 1024)
-    return raw / 1024.0
+    peak = _rusage_peak_mb()
+    if peak is not None:
+        return peak
+    return process_memory_mb()

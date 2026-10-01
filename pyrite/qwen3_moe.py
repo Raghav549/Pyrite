@@ -185,14 +185,25 @@ def _resolve_vocab_size(metadata: Mapping[str, object], get_key) -> int:
 
     ``tokenizer.ggml.vocab_size`` is not part of the published GGUF contract;
     files carry the token array and/or ``{arch}.vocab_size``.  Prefer the
-    explicit key, then the token array length, then the embedding shape.
+    explicit key, then the token array length, then the legacy key.
+
+    When both the explicit key and a token array are present they must agree:
+    llama.cpp derives the vocabulary from the tokenizer and refuses files
+    where the embedding table disagrees, so Pyrite refuses them too instead of
+    generating undecodable token ids.
     """
     explicit = metadata.get(f"{ARCHITECTURE}.vocab_size")
-    if explicit:
-        return int(explicit)
     tokens = metadata.get("tokenizer.ggml.tokens")
-    if isinstance(tokens, (list, tuple)) and tokens:
-        return len(tokens)
+    token_count = len(tokens) if isinstance(tokens, (list, tuple)) and tokens else 0
+    if explicit:
+        if token_count and int(explicit) != token_count:
+            raise Qwen3MoEContractError(
+                f"{ARCHITECTURE}.vocab_size is {int(explicit)} but the tokenizer "
+                f"carries {token_count} tokens; refusing a self-inconsistent checkpoint"
+            )
+        return int(explicit)
+    if token_count:
+        return token_count
     legacy = metadata.get("tokenizer.ggml.vocab_size")
     if legacy:
         return int(legacy)
