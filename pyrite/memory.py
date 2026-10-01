@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from collections import OrderedDict
-from dataclasses import dataclass, field
 import os
 import resource
-
-from typing import Generic, Iterator, TypeVar
+import sys
+from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import suppress
+from dataclasses import dataclass, field
+from typing import Generic, TypeVar
 
 T = TypeVar("T")
 
@@ -17,11 +19,18 @@ class MemoryStats:
     hits: int = 0
     misses: int = 0
     evictions: int = 0
+    rejected: int = 0
 
 
 @dataclass
 class LRUResidentCache(Generic[T]):
-    max_items: int
+    """Bounded LRU cache with both an item and a byte ceiling.
+
+    The byte ceiling is authoritative: a single item larger than ``max_bytes``
+    is rejected with ``MemoryError`` rather than silently blowing the budget.
+    """
+
+    max_items: int | None
     max_bytes: int | None = None
     _data: OrderedDict[str, T] = field(default_factory=OrderedDict)
     _sizes: dict[str, int] = field(default_factory=dict)
@@ -48,6 +57,7 @@ class LRUResidentCache(Generic[T]):
             self.stats.estimated_bytes -= self._sizes.pop(key, 0)
 
         if self.max_bytes is not None and estimated_bytes > self.max_bytes:
+            self.stats.rejected += 1
             raise MemoryError(f"block {key!r} exceeds resident byte budget")
 
         self._data[key] = value
@@ -55,7 +65,7 @@ class LRUResidentCache(Generic[T]):
         self.stats.estimated_bytes += estimated_bytes
 
         while (
-            len(self._data) > max(1, self.max_items)
+            (self.max_items is not None and len(self._data) > max(1, self.max_items))
             or not self._would_fit(0)
         ):
             old_key, _ = self._data.popitem(last=False)
@@ -64,8 +74,18 @@ class LRUResidentCache(Generic[T]):
 
         self.stats.resident_items = len(self._data)
 
+    def discard(self, key: str) -> None:
+        """Drop ``key`` if present, keeping byte accounting consistent."""
+        if key in self._data:
+            self._data.pop(key)
+            self.stats.estimated_bytes -= self._sizes.pop(key, 0)
+            self.stats.resident_items = len(self._data)
+
     def __contains__(self, key: str) -> bool:
         return key in self._data
+
+    def __len__(self) -> int:
+        return len(self._data)
 
     def keys(self) -> Iterator[str]:
         return iter(self._data.keys())
@@ -74,8 +94,11 @@ class LRUResidentCache(Generic[T]):
 def process_memory_mb() -> float:
     """Best-effort current RSS in MB, falling back to platform peak RSS."""
     if os.name == "nt":
-        try:
+        # The Win32 route is best effort: any failure falls back to the
+        # standard-library peak RSS value.
+        with suppress(AttributeError, OSError, TypeError, ValueError):
             import ctypes
+
             class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
                 _fields_ = [
                     ("cb", ctypes.c_ulong),
@@ -83,6 +106,7 @@ def process_memory_mb() -> float:
                     ("PeakWorkingSetSize", ctypes.c_size_t),
                     ("WorkingSetSize", ctypes.c_size_t),
                 ]
+
             counters = PROCESS_MEMORY_COUNTERS()
             counters.cb = ctypes.sizeof(counters)
             handle = ctypes.windll.kernel32.GetCurrentProcess()
@@ -91,9 +115,7 @@ def process_memory_mb() -> float:
             )
             if ok:
                 return counters.WorkingSetSize / (1024 * 1024)
-        except Exception:
-            pass
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+        return _peak_rss_mb()
 
     try:
         with open("/proc/self/status", encoding="utf-8") as fh:
@@ -102,4 +124,15 @@ def process_memory_mb() -> float:
                     return float(line.split()[1]) / 1024.0
     except (OSError, ValueError):
         pass
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    return _peak_rss_mb()
+
+
+def _peak_rss_mb() -> float:
+    """Peak RSS in MB, normalized across platforms.
+
+    ``ru_maxrss`` is reported in kilobytes on Linux and in bytes on macOS.
+    """
+    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return raw / (1024 * 1024)
+    return raw / 1024.0

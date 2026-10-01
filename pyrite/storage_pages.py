@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import hashlib
 import mmap
+from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -50,21 +50,35 @@ class ContentAddressedPager:
 
 
 class MMapPage:
-    """Small lifetime-safe mmap view over one immutable page."""
+    """Small lifetime-safe mmap view over one immutable page.
+
+    Views handed out by :meth:`view` are tracked so ``close()`` can release any
+    that are still exported; otherwise ``mmap.close()`` raises ``BufferError``
+    and the mapping leaks until garbage collection.
+    """
 
     def __init__(self, page: WeightPage):
         self.page = page
         self._fh = page.path.open("rb")
         self._map = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        self._views: list[memoryview] = []
 
     def view(self) -> memoryview:
-        return memoryview(self._map)
+        view = memoryview(self._map)
+        self._views.append(view)
+        return view
 
     def close(self) -> None:
+        for view in self._views:
+            try:
+                view.release()
+            except ValueError:  # already released by the caller
+                continue
+        self._views.clear()
         self._map.close()
         self._fh.close()
 
-    def __enter__(self) -> "MMapPage":
+    def __enter__(self) -> MMapPage:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

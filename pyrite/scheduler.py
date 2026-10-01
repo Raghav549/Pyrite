@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections import deque
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,7 @@ class BlockScheduler:
         required = (blocks[current_index],) if 0 <= current_index < len(blocks) else ()
         future = tuple(blocks[current_index + 1: current_index + 1 + self.prefetch_depth])
         keep = set(required) | set(future)
-        evict = tuple(x for x in resident if x not in keep)
+        # Sorted so a plan is reproducible for the same resident set.
+        evict = tuple(sorted(x for x in resident if x not in keep))
         self._history.extend(required)
         return LoadPlan(required, future, evict)

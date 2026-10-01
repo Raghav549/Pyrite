@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .config import RuntimeConfig
-from .kv import KVBudget
+from .gpu import AcceleratorInfo, detect_accelerators
 from .kernels.t_sar import ReferenceTernaryKernel
+from .kv import KVBudget
 from .memory import LRUResidentCache, process_memory_mb
 from .policy import DevicePolicy
 from .prefetch import PrefetchPredictor
@@ -24,10 +25,16 @@ class RuntimeStatus:
     cache_misses: int
     offline: bool
 
+    def to_dict(self) -> dict[str, object]:
+        return dict(self.__dict__)
+
 
 class PyriteRuntime:
+    """Owns the memory budget, block store, cache and scheduling policy."""
+
     def __init__(self, config: RuntimeConfig | None = None):
         self.config = config or RuntimeConfig.from_env()
+        self.config.validate()
         self.config.storage_dir.mkdir(parents=True, exist_ok=True)
 
         self.policy = DevicePolicy(
@@ -53,17 +60,21 @@ class PyriteRuntime:
     def route(self, prompt: str) -> Route:
         return self.router.route(prompt)
 
+    def accelerators(self) -> tuple[AcceleratorInfo, ...]:
+        return tuple(detect_accelerators())
+
     def plan(self, blocks: list[str], current_index: int = 0) -> LoadPlan:
         if not blocks:
             return LoadPlan((), (), ())
-        current = blocks[current_index] if 0 <= current_index < len(blocks) else blocks[0]
-        candidates = blocks[current_index + 1 :]
+        index = current_index if 0 <= current_index < len(blocks) else 0
+        current = blocks[index]
+        candidates = blocks[index + 1:]
         predicted = self.prefetch.predict(
             current,
             candidates,
             self.config.prefetch_depth,
         )
-        plan = self.scheduler.plan(blocks, current_index, set(self.cache.keys()))
+        plan = self.scheduler.plan(blocks, index, set(self.cache.keys()))
         return LoadPlan(plan.required, predicted or plan.prefetch, plan.evict)
 
     def load_block_bytes(self, block_id: str) -> bytes:
@@ -72,10 +83,7 @@ class PyriteRuntime:
             self.prefetch.observe(block_id)
             return hit
 
-        ref: BlockRef | None = next(
-            (item for item in self.store.iter_blocks() if item.block_id == block_id),
-            None,
-        )
+        ref: BlockRef | None = self.store.get(block_id)
         if ref is None:
             raise FileNotFoundError(f"unknown local block: {block_id}")
 
@@ -100,3 +108,16 @@ class PyriteRuntime:
             self.cache.stats.misses,
             self.config.offline,
         )
+
+    def describe(self) -> dict[str, object]:
+        return {
+            "config": self.config.to_dict(),
+            "status": self.status().to_dict(),
+            "accelerators": [info.__dict__ for info in self.accelerators()],
+            "kv": {
+                "max_tokens": self.kv.max_tokens,
+                "tokens_seen": self.kv.stats.tokens_seen,
+                "tokens_kept": self.kv.stats.tokens_kept,
+                "tokens_dropped": self.kv.stats.tokens_dropped,
+            },
+        }

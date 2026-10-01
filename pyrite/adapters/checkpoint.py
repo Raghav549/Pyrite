@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import struct
 
-from .base import WeightBlock
+from .base import TensorMeta, WeightBlock
 
 
 @dataclass(frozen=True)
@@ -69,6 +68,20 @@ class ChunkedFileAdapter:
             offset += length
             index += 1
         return result
+
+    def tensors(self) -> list[TensorMeta]:
+        return [
+            TensorMeta(
+                name=block.block_id,
+                block_id=block.block_id,
+                shape=(block.size,),
+                dtype=self.info.format,
+                ggml_type=None,
+                offset=block.offset,
+                size=block.size,
+            )
+            for block in self.blocks()
+        ]
 
     def load(self, block: WeightBlock) -> memoryview:
         with self.path.open("rb") as fh:

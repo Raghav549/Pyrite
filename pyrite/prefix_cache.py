@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from collections import OrderedDict
 import hashlib
+from collections import OrderedDict
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)

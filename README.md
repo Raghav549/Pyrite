@@ -40,9 +40,7 @@ Applications embedding Pyrite must keep telemetry, cloud sync, and remote tools 
 
 ## Qwen3-MoE checkpoint validation
 
-Pyrite includes a strict GGUF checkpoint contract for Qwen3-MoE (`qwen3moe`), including architecture metadata parsing, expert count/top-k discovery, tensor-index validation, and bounded streaming readiness checks. It does not fake full generation when a native streaming kernel is unavailable.
-
-For the current Qwen3-235B-A22B-Instruct-2507 GGUF family, Q4_K_M is published as five split GGUF files. Merge the split files with `llama-gguf-split` before passing the resulting single GGUF path to Pyrite. The full Q4_K_M set is roughly 142 GB, while the runtime's 4 GB setting is a resident-memory budget, not a promise that the whole model fits in RAM.
+Pyrite includes a strict GGUF checkpoint contract for Qwen3-MoE (`qwen3moe`), including architecture metadata parsing, expert count/top-k discovery, tensor-index validation, and bounded streaming readiness checks.
 
 Validate a checkpoint locally:
 
@@ -50,11 +48,36 @@ Validate a checkpoint locally:
 python -m pyrite qwen3-check /path/to/Qwen3-235B-A22B-Q4_K_M.gguf
 ```
 
+For the current Qwen3-235B-A22B-Instruct-2507 GGUF family, Q4_K_M is published as five split GGUF files. Merge the split files with `llama-gguf-split` before passing the resulting single GGUF path to Pyrite. The full Q4_K_M set is roughly 142 GB, while the runtime's 4 GB setting is a resident-memory budget, not a promise that the whole model fits in RAM.
+
+## Native streaming generation
+
+`pyrite generate` runs the checkpoint through the reference executor: GGUF tensors
+are streamed (whole dense tensors, per-expert slices of the stacked MoE tensors),
+decoded from their quantization with bounded chunks, and executed by a
+memory-budgeted forward pass with an incremental KV cache. The KV footprint is
+checked against the configured working set at startup, and generation stops at
+the KV token budget instead of silently discarding context.
+
+```bash
+python -m pyrite generate model.gguf --prompt "hello" --max-new-tokens 16 --temperature 0
+python -m pyrite tokenize model.gguf "hello world"
+python -m pyrite.bench --checkpoint model.gguf --tokens 8
+```
+
+Reference decoders are available for F32, F16, BF16, F64, I8/I16/I32/I64,
+Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1 and Q2_K..Q6_K. Checkpoints that use other
+quantizations are reported and refused rather than approximated. This path is a
+correctness reference written in pure Python: it is not a throughput-optimized
+kernel, and decoding a 100+ GB checkpoint token-by-token on a CPU will be slow.
+
 ## Development
 
 ```bash
+python -m pip install -e ".[dev]"
 python -m pyrite status
 python -m pyrite route "write a Python API"
 python -m pyrite.bench
+python -m ruff check pyrite tests
 python -m pytest
 ```

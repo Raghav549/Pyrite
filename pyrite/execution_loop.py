@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Callable, Iterable
 
 from .io_scheduler import IOComputeScheduler, IOComputeTask
 from .plan_feedback import ExecutionPlanFeedback

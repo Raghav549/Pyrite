@@ -1,6 +1,6 @@
-from pathlib import Path
 import json
 import struct
+from pathlib import Path
 
 from pyrite.adapters.checkpoint import ChunkedFileAdapter, detect_checkpoint
 from pyrite.adapters.safetensors import SafetensorsAdapter

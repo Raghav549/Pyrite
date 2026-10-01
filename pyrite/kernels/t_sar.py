@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 
 @dataclass(frozen=True)
@@ -24,7 +24,10 @@ class ReferenceTernaryKernel:
             raise ValueError("vector width does not match matrix width")
         if any(len(row) != width for row in matrix):
             raise ValueError("matrix rows must have equal width")
-        return [sum(int(w) * int(x) for w, x in zip(row, vector)) for row in matrix]
+        return [
+            sum(int(w) * int(x) for w, x in zip(row, vector, strict=True))
+            for row in matrix
+        ]
 
     def estimate_bits(self, rows: int, cols: int) -> int:
         if rows < 0 or cols < 0:

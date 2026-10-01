@@ -6,7 +6,6 @@ from pathlib import Path
 from .checkpoint import open_checkpoint
 from .config import RuntimeConfig
 from .engine import PyriteRuntime
-from .inference import LocalInference
 from .stream import BlockStreamer
 
 
@@ -56,7 +55,7 @@ class LocalModel:
     def close(self) -> None:
         self.streamer.close()
 
-    def __enter__(self) -> "LocalModel":
+    def __enter__(self) -> LocalModel:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

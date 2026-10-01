@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import WeightBlock
+from ..ggml_types import type_name
+from .base import TensorMeta, WeightBlock
 from .gguf import GGUFReader
 
 
@@ -16,20 +17,32 @@ class GGUFAdapter:
         self.reader = GGUFReader(self.path)
 
     def blocks(self) -> list[WeightBlock]:
-        result: list[WeightBlock] = []
-        for index, tensor in enumerate(self.reader.tensor_index()):
-            result.append(
-                WeightBlock(
-                    block_id=f"tensor:{tensor.name}",
-                    path=self.path,
-                    offset=tensor.offset,
-                    size=tensor.size,
-                    dtype=f"ggml:{tensor.ggml_type}",
-                    kind="layer",
-                    index=index,
-                )
+        return [
+            WeightBlock(
+                block_id=f"tensor:{tensor.name}",
+                path=self.path,
+                offset=tensor.offset,
+                size=tensor.size,
+                dtype=f"ggml:{type_name(tensor.ggml_type)}",
+                kind="layer",
+                index=index,
             )
-        return result
+            for index, tensor in enumerate(self.reader.tensor_index())
+        ]
+
+    def tensors(self) -> list[TensorMeta]:
+        return [
+            TensorMeta(
+                name=tensor.name,
+                block_id=f"tensor:{tensor.name}",
+                shape=tensor.dims,
+                dtype=type_name(tensor.ggml_type),
+                ggml_type=tensor.ggml_type,
+                offset=tensor.offset,
+                size=tensor.size,
+            )
+            for tensor in self.reader.tensor_index()
+        ]
 
     def load(self, block: WeightBlock) -> memoryview:
         if block.path != self.path:

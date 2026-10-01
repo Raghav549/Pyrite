@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import WeightBlock
+from .base import TensorMeta, WeightBlock
 
 
 class RawShardAdapter:
@@ -31,6 +31,20 @@ class RawShardAdapter:
                 )
             )
         return result
+
+    def tensors(self) -> list[TensorMeta]:
+        return [
+            TensorMeta(
+                name=block.block_id,
+                block_id=block.block_id,
+                shape=(block.size,),
+                dtype=block.dtype,
+                ggml_type=None,
+                offset=block.offset,
+                size=block.size,
+            )
+            for block in self.blocks()
+        ]
 
     def load(self, block: WeightBlock) -> memoryview:
         with block.path.open("rb") as fh:

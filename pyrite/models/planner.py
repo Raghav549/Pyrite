@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from time import monotonic
 
 from .spec import BlockKind, ModelBlock, ModelManifest
 
@@ -31,15 +30,19 @@ class ModelExecutionPlanner:
         self._observations: dict[str, list[PlanObservation]] = {}
 
     def units(self) -> tuple[ExecutionUnit, ...]:
+        """Group ordered blocks into units that each fit ``max_unit_bytes``."""
         result: list[ExecutionUnit] = []
         current: list[str] = []
         current_bytes = 0
 
         for block in self.manifest.ordered_blocks():
             if block.size_bytes > self.max_unit_bytes:
+                # Oversized block: it still has to be executed, on its own.
+                if current:
+                    result.append(ExecutionUnit(tuple(current), current_bytes))
+                    current = []
+                    current_bytes = 0
                 result.append(ExecutionUnit((block.block_id,), block.size_bytes))
-                current = []
-                current_bytes = 0
                 continue
 
             if current and current_bytes + block.size_bytes > self.max_unit_bytes:
@@ -64,7 +67,13 @@ class ModelExecutionPlanner:
     def unit_id(unit: ExecutionUnit) -> str:
         return "|".join(unit.block_ids)
 
-    def observe(self, unit: ExecutionUnit, io_seconds: float, compute_seconds: float, cache_hit: bool) -> PlanObservation:
+    def observe(
+        self,
+        unit: ExecutionUnit,
+        io_seconds: float,
+        compute_seconds: float,
+        cache_hit: bool,
+    ) -> PlanObservation:
         if io_seconds < 0 or compute_seconds < 0:
             raise ValueError("timings must be non-negative")
         observation = PlanObservation(self.unit_id(unit), io_seconds, compute_seconds, cache_hit)
@@ -72,6 +81,7 @@ class ModelExecutionPlanner:
         return observation
 
     def score(self, unit: ExecutionUnit) -> float:
+        """Measured quality of a unit: cache hits per second of latency."""
         records = self._observations.get(self.unit_id(unit), [])
         if not records:
             return 0.0
@@ -81,4 +91,10 @@ class ModelExecutionPlanner:
         return hit_rate / max(1e-9, latency)
 
     def reorder_for_locality(self, units: tuple[ExecutionUnit, ...]) -> tuple[ExecutionUnit, ...]:
-        return tuple(sorted(enumerate(units), key=lambda item: (-self.score(item[1]), item[0]))[i][1] for i in range(len(units)))
+        """Stable-sort units by measured score, keeping plan order for unknowns."""
+        return tuple(
+            unit for _, unit in sorted(enumerate(units), key=lambda item: (-self.score(item[1]), item[0]))
+        )
+
+    def observations(self) -> dict[str, tuple[PlanObservation, ...]]:
+        return {key: tuple(value) for key, value in self._observations.items()}

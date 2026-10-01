@@ -11,7 +11,7 @@ class Tokenizer:
 
 class Backend:
     def generate(self, input_ids, max_new_tokens, temperature, top_p):
-        return input_ids + [max_new_tokens]
+        return [*input_ids, max_new_tokens]
 
 
 def test_local_inference_facade():
