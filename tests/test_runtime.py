@@ -1,3 +1,5 @@
+import pytest
+
 from pyrite.config import RuntimeConfig
 from pyrite.engine import PyriteRuntime
 from pyrite.kernels.t_sar import ReferenceTernaryKernel
@@ -9,6 +11,11 @@ def test_four_gb_budget_defaults():
     assert status.ram_budget_mb == 4096
     assert status.working_set_mb == 3584
     assert status.offline is True
+
+
+def test_runtime_config_rejects_non_integer_budget_values():
+    with pytest.raises(ValueError, match="ram_budget_mb must be an integer"):
+        RuntimeConfig(ram_budget_mb="4096").validate()
 
 
 def test_router():

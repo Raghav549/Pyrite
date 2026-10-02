@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from pyrite.ggml_types import spec as ggml_spec
 from pyrite.ggml_types import tensor_size
 from pyrite.tokenizer import bytes_to_unicode
 
@@ -122,7 +123,8 @@ def build_tiny_checkpoint(
         elements = _prod(dims)
         # Norms and other small vectors stay F32, exactly like shipped files;
         # only block-aligned matrices take the requested quantized type.
-        use_type = ggml_type if elements % 256 == 0 else 0
+        block_size = ggml_spec(ggml_type).block_size
+        use_type = ggml_type if dims and dims[0] % block_size == 0 and elements % block_size == 0 else 0
         if use_type == 0:
             payload = _tensor(next_float, elements, scale)
         else:
@@ -147,6 +149,7 @@ def build_tiny_checkpoint(
     builder.add("qwen3moe.rope.freq_base", 10000.0)
     builder.add("qwen3moe.context_length", cfg.max_position_embeddings)
     builder.add("qwen3moe.vocab_size", cfg.vocab_size)
+    builder.add("qwen3moe.tied_word_embeddings", not write_output_weight)
     if tokenizer:
         build_tokenizer_metadata(builder)
 

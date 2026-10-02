@@ -99,6 +99,8 @@ def build_tiny_dense_checkpoint(
     builder.add(f"{arch}.rope.freq_base", cfg.rope_theta)
     builder.add(f"{arch}.context_length", cfg.max_position_embeddings)
     builder.add(f"{arch}.vocab_size", cfg.vocab_size)
+    builder.add(f"{arch}.tied_word_embeddings", not write_output_weight)
+    builder.add(f"{arch}.attention.qk_norm", cfg.qk_norm)
     build_tokenizer_metadata(builder, cfg.vocab_size)
 
     add("token_embd.weight", (cfg.hidden_size, cfg.vocab_size), 0.2)

@@ -114,8 +114,15 @@ def known_types() -> tuple[GGMLTypeSpec, ...]:
     return tuple(_TYPES[key] for key in sorted(_TYPES))
 
 
-def tensor_size(elements: int, type_id: int) -> int:
-    """Byte size of ``elements`` consecutive values of ``type_id``."""
+def row_size(elements: int, type_id: int) -> int:
+    """Byte size of one GGML row containing ``elements`` values.
+
+    Quantized GGML tensors are quantized row-by-row.  Checking only the total
+    element count can accept an invalid shape whose first dimension is not a
+    whole quantization block (the error can be hidden by multiplying by the
+    number of rows).  GGUF sizes must therefore be calculated from dimension 0
+    and then multiplied by the number of rows.
+    """
     t = spec(type_id)
     if elements < 0:
         raise ValueError("elements must be non-negative")
@@ -123,7 +130,12 @@ def tensor_size(elements: int, type_id: int) -> int:
         return 0
     if t.block_size != 1 and elements % t.block_size:
         raise ValueError(
-            f"{t.name} requires element count divisible by {t.block_size}, got {elements}"
+            f"{t.name} row requires element count divisible by {t.block_size}, got {elements}"
         )
     blocks = elements if t.block_size == 1 else elements // t.block_size
     return blocks * t.bytes_per_block
+
+
+def tensor_size(elements: int, type_id: int) -> int:
+    """Byte size of a linear stream of ``elements`` values of ``type_id``."""
+    return row_size(elements, type_id)

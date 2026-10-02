@@ -67,6 +67,7 @@ def k_requantize_checkpoint(src: Path, dst: Path, ggml_type: int) -> Path:
         if (
             tensor.ggml_type == 0
             and tensor.element_count > 0
+            and tensor.dims[0] % 256 == 0
             and tensor.element_count % 256 == 0
         ):
             values = list(struct.unpack(f"<{tensor.element_count}f", payload))
@@ -148,6 +149,12 @@ def test_k_quantized_execution_matches_oracle_decoded_reference(
             assert worst <= 5e-3, f"position {position}: max abs diff {worst}"
         assert executor.stats.tensors_streamed > 0
         assert executor.stats.expert_slices_streamed > 0
+        if ggml_type in {12, 14}:
+            from pyrite.kernels.native import native_available
+
+            if native_available():
+                assert executor.stats.native_kernel_calls > 0
+                assert executor.stats.native_bytes > 0
 
 
 @pytest.mark.parametrize("ggml_type", sorted(K_ENCODERS))

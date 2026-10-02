@@ -46,3 +46,18 @@ def test_rss_degrades_gracefully_when_everything_is_missing(monkeypatch):
     monkeypatch.setattr(memory, "_rusage_peak_mb", lambda: None)
     monkeypatch.setattr(memory, "_windows_working_set_mb", lambda: None)
     assert memory.process_memory_mb() == 0.0
+
+
+def test_rss_monitor_enforces_the_configured_ceiling(monkeypatch):
+    import pytest
+
+    import pyrite.memory as memory
+
+    monkeypatch.setattr(memory, "process_rss_bytes", lambda: 2048)
+    monkeypatch.setattr(memory, "process_peak_rss_mb", lambda: 0.0)
+    monitor = memory.RSSMonitor(limit_bytes=1024)
+    with pytest.raises(MemoryError, match="above configured limit"):
+        monitor.sample("unit-test")
+    assert monitor.current_bytes == 2048
+    assert monitor.peak_bytes == 2048
+    assert monitor.last_stage == "unit-test"

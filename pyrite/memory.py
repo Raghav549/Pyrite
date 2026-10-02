@@ -186,13 +186,73 @@ def process_memory_mb() -> float:
     return _rusage_peak_mb() or 0.0
 
 
-def _peak_rss_mb() -> float:
-    """Peak RSS in MB, normalized across platforms.
+def process_rss_bytes() -> int:
+    """Best-effort current resident set size in bytes (zero means unknown)."""
+    measured = process_memory_mb()
+    return max(0, int(measured * 1024 * 1024))
 
-    Kept for backwards compatibility; prefers the Unix ``resource`` peak and
-    otherwise falls back to whatever :func:`process_memory_mb` can measure.
-    """
+
+def process_peak_rss_mb() -> float:
+    """Best-effort process high-water RSS, normalized to MiB."""
     peak = _rusage_peak_mb()
-    if peak is not None:
-        return peak
-    return process_memory_mb()
+    return peak if peak is not None else process_memory_mb()
+
+
+def _peak_rss_mb() -> float:
+    """Backwards-compatible private alias for peak RSS measurement."""
+    return process_peak_rss_mb()
+
+
+class RSSMonitor:
+    """Sample and enforce an absolute per-process RSS ceiling.
+
+    The runtime separately budgets managed working-set items (KV, cached GGUF
+    byte ranges and small tensors).  This monitor catches Python/runtime
+    overhead and transient allocations that object-size accounting cannot
+    predict exactly.  RSS reporting is best-effort on platforms where the OS
+    does not expose current process memory.
+    """
+
+    def __init__(self, limit_bytes: int):
+        if limit_bytes <= 0:
+            raise ValueError("RSS limit must be positive")
+        self.limit_bytes = int(limit_bytes)
+        self.current_bytes = 0
+        self.peak_bytes = 0
+        self.samples = 0
+        self.last_stage = "startup"
+        self.unknown = False
+
+    def sample(self, stage: str, *, enforce: bool = True) -> int:
+        current = process_rss_bytes()
+        self.samples += 1
+        self.last_stage = stage
+        if current == 0:
+            self.unknown = True
+            return 0
+        self.current_bytes = current
+        self.peak_bytes = max(self.peak_bytes, current)
+        os_peak = process_peak_rss_mb()
+        if os_peak > 0:
+            self.peak_bytes = max(self.peak_bytes, int(os_peak * 1024 * 1024))
+        if enforce and self.peak_bytes > self.limit_bytes:
+            raise MemoryError(
+                f"process RSS reached {self.peak_bytes / (1024 * 1024):.1f} MiB "
+                f"by {stage}, above configured limit "
+                f"{self.limit_bytes / (1024 * 1024):.0f} MiB"
+            )
+        return current
+
+    def to_dict(self) -> dict[str, int | float | str | bool]:
+        mib = 1024 * 1024
+        return {
+            "rss_current_bytes": self.current_bytes,
+            "rss_current_mb": self.current_bytes / mib,
+            "rss_peak_bytes": self.peak_bytes,
+            "rss_peak_mb": self.peak_bytes / mib,
+            "rss_limit_bytes": self.limit_bytes,
+            "rss_limit_mb": self.limit_bytes / mib,
+            "rss_samples": self.samples,
+            "rss_last_stage": self.last_stage,
+            "rss_unknown": self.unknown,
+        }

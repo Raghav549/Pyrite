@@ -36,6 +36,9 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["pyrite*"]
 
+[tool.setuptools.package-data]
+"pyrite.kernels" = ["native.c"]
+
 [tool.ruff]
 target-version = "py310"
 
