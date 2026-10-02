@@ -4,108 +4,80 @@ Pyrite is a research runtime for private, local AI on memory-constrained devices
 
 ## Core idea
 
-Separate model capacity from resident memory. Model blocks or experts may live in local storage while the runtime keeps a bounded working set in RAM and schedules the next blocks.
+Separate model capacity from resident memory. GGUF tensors and MoE expert slices are read on demand from local storage; only a byte-capped working set, compact KV state, and the current activations are kept in memory.
 
 ## Target
 
-First-class target: laptops with about 4 GB RAM. The budget is configurable because real memory and speed depend on the operating system, model, storage, context length, and CPU.
+First-class target: laptops with about 4 GB RAM. The default profile sets a 4096 MiB process-RSS ceiling (enforced where the OS exposes RSS), reserves 768 MiB for the interpreter and transient allocations, and budgets the remaining 3328 MiB for managed runtime state. Managed cache/KV budgets are enforced independently; a missing OS RSS counter is reported as unknown, not treated as zero usage. These limits are not a promise that every model or context fits. Lower `PYRITE_KV_TOKENS` when the KV cache cannot fit.
 
 ## Architecture
 
-- bounded resident cache
-- local block and shard store
-- route selection
-- execution planning
-- predictive prefetch hooks
-- KV-cache budgeting
-- offline-first policy
-- pluggable model adapters
-- pluggable CPU kernels
-- T-SAR-inspired ternary kernel extension
-
-## Research basis
-
-Pyrite tracks research directions in extreme quantization, structured sparsity, MoE expert offloading, predictive prefetching, KV-cache management, and CPU-only ternary inference.
-
-- AQLM: https://arxiv.org/abs/2401.06118
-- T-SAR: https://arxiv.org/abs/2511.13676
-- SPICE: https://arxiv.org/abs/2608.21240
-- OLED-MoE: https://arxiv.org/abs/2609.33385
-
-## Privacy
-
-The core runtime has no network dependency for inference and defaults to offline operation. Prompts and model state are not sent to a data center by the runtime.
-
-Applications embedding Pyrite must keep telemetry, cloud sync, and remote tools disabled when strict local-only operation is required.
+- bounded, byte-accounted cache with LRU eviction and range reads
+- local block and shard store, content-addressed paging, and offline-first policy
+- route selection, execution planning, and predictive prefetch hooks
+- bounded compact KV cache with `stop` and `sliding_window` policies
+- GGUF adapters with per-row quantized-size validation
+- CPU transformer execution for supported dense and MoE architectures
+- optional portable C Q4_K/Q6_K streaming kernels; Python reference decoders remain available
+- T-SAR-inspired ternary reference kernel (not the proposed hardware modification)
 
 ## Supported architectures
 
-Pyrite executes three GGUF architectures and dispatches on the file's
-`general.architecture` automatically:
+Pyrite dispatches on GGUF `general.architecture`:
 
-- `qwen3moe` — Qwen3-MoE (GQA + QK-norm attention, top-k SwiGLU experts
-  streamed as per-expert slices)
-- `qwen3` — dense decoder-only Qwen3 (same attention core, dense SwiGLU MLP)
-- `llama` — dense decoder-only Llama (GQA without QK-norm, partial rotary
-  via `rope_dimension_count`, dense SwiGLU MLP)
+- `qwen3moe` — Qwen3-MoE GQA, per-head QK norm, softmax router, top-k SwiGLU experts streamed from stacked expert tensors
+- `qwen3` — dense Qwen3 with GQA, QK norm, and dense SwiGLU MLP
+- `llama` — dense Llama with GQA, optional partial rotary dimensions, and dense SwiGLU MLP
 
-Unknown architectures are refused with an explicit error instead of being
-mis-executed.
+Unknown architectures and unsupported tensor types are refused rather than approximated. `qwen3-check --require-canonical` additionally checks the canonical Qwen3-MoE metadata contract of 94 layers, 128 experts, and top-8 routing.
 
-## Qwen3-MoE checkpoint validation
-
-Pyrite includes a strict GGUF checkpoint contract for Qwen3-MoE (`qwen3moe`), including architecture metadata parsing, expert count/top-k discovery, tensor-index validation, and bounded streaming readiness checks.
-
-Validate a checkpoint locally:
+## Qwen3 checkpoint validation
 
 ```bash
-python -m pyrite qwen3-check /path/to/Qwen3-235B-A22B-Q4_K_M.gguf
+python -m pyrite qwen3-check /path/to/model.gguf
+python -m pyrite qwen3-check /path/to/model.gguf --full
+python -m pyrite qwen3-check /path/to/model.gguf --require-canonical
 ```
 
-For the current Qwen3-235B-A22B-Instruct-2507 GGUF family, Q4_K_M is published as five split GGUF files. Merge the split files with `llama-gguf-split` before passing the resulting single GGUF path to Pyrite. The full Q4_K_M set is roughly 142 GB, while the runtime's 4 GB setting is a resident-memory budget, not a promise that the whole model fits in RAM.
+The full report includes tensor sizes, the largest streamed row or expert slice, and whether those ranges fit the current budget. For the Qwen3-235B-A22B-Instruct-2507 GGUF family, Q4_K_M is published as five split files; use `llama-gguf-split` to merge them before passing a single GGUF file to Pyrite. The full Q4_K_M set is roughly 142 GB. A 4 GB setting bounds resident memory; it does not make the full model fit on disk or make a large KV context affordable.
 
-## Native streaming generation
-
-`pyrite generate` runs the checkpoint through the reference executor: GGUF tensors
-are streamed (whole dense tensors, per-expert slices of the stacked MoE tensors),
-decoded from their quantization with bounded chunks, and executed by a
-memory-budgeted forward pass with an incremental KV cache. The KV footprint is
-checked against the configured working set at startup, and generation stops at
-the KV token budget instead of silently discarding context.
+## Local generation and benchmarking
 
 ```bash
 python -m pyrite generate model.gguf --prompt "hello" --max-new-tokens 16 --temperature 0
+python -m pyrite generate model.gguf --prompt "hello" --kv-cache-policy sliding_window
 python -m pyrite tokenize model.gguf "hello world"
 python -m pyrite.bench --checkpoint model.gguf --tokens 8
 ```
 
-Reference decoders are available for F32, F16, BF16, F64, I8/I16/I32/I64,
-Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1 and Q2_K..Q6_K. Checkpoints that use other
-quantizations are reported and refused rather than approximated. This path is a
-correctness reference written in pure Python: it is not a throughput-optimized
-kernel, and decoding a 100+ GB checkpoint token-by-token on a CPU will be slow.
+The executor streams dense projection rows, selected MoE expert slices, and vocabulary rows; it does not materialize the whole model. KV entries are stored as compact fp32 arrays. The default `stop` policy ends generation when the configured KV limit is reached; `sliding_window` evicts the oldest KV entries and continues up to the model/runtime context limit.
+
+A C compiler (`cc`, `gcc`, or `clang`) enables the optional scalar C Q4_K/Q6_K kernels. Pyrite compiles the small, Python-header-free C source into the system temporary directory on first use, borrows quantized buffers without copying them, and fuses dequantization with matrix-vector multiplication. If compilation is unavailable, those types use the bounded Python reference path instead. This is not a throughput claim: transformer orchestration and non-Q4_K/Q6_K tensor types still use Python, and no published-checkpoint performance result is claimed here.
+
+Reference decoders cover F32, F16, BF16, F64, I8/I16/I32/I64, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1, and Q2_K through Q6_K. No runtime oracle, cloud service, or network access is required for inference.
 
 ## Validation
 
-`scripts/llama_crosscheck.py` cross-validates Pyrite against official
-`llama.cpp` binaries (official quantizer acceptance, exact decode parity,
-deterministic generation, and PPL agreement to ~1e-5). Measured numbers,
-greedy-parity token IDs, and the openly-unproven list live in
-`docs/validation.md`.
+`scripts/llama_crosscheck.py` can compare Pyrite with official `llama.cpp` binaries on locally generated GGUF fixtures (decoder parity, deterministic generation, and perplexity). The measured fixture results and remaining gaps are recorded in [`docs/validation.md`](docs/validation.md). A fixture crosscheck does not substitute for running a published checkpoint.
 
 ```bash
 python scripts/llama_crosscheck.py --llama-bin /path/to/llama.cpp/build/bin
 ```
 
+## Privacy
+
+Inference defaults to offline operation. Prompts and model state are not sent to a data center by the runtime. Applications embedding Pyrite must also keep their own telemetry, cloud sync, and remote tools disabled when strict local-only operation is required.
+
 ## Development
 
-The `dev` extra installs the optional GGUF and NumPy oracle used to check decoder parity; these are test-only and are not runtime dependencies.
+The `dev` extra installs the optional GGUF and NumPy oracles used by decoder-parity tests; these are test-only dependencies.
 
 ```bash
 python -m pip install -e ".[dev]"
 python -m pyrite status
 python -m pyrite route "write a Python API"
 python -m pyrite.bench
-python -m ruff check pyrite tests scripts
-python -m pytest
+python -m ruff check pyrite tests scripts setup.py
+python -m compileall -q pyrite tests scripts
+python -m pytest -q
 ```

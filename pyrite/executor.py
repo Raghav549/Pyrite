@@ -1,22 +1,16 @@
-"""Native streaming executor for Qwen3-MoE GGUF checkpoints.
+"""Bounded CPU executor for Qwen3-MoE and dense GGUF checkpoints.
 
-This is the "native streaming kernel" the runtime was missing: a real,
-dependency-free decoder that
-
-* reads tensors from the GGUF file through :class:`~pyrite.stream.BlockStreamer`,
-  so resident memory stays inside the configured budget and evictions are real;
-* streams individual experts out of the stacked 3D ``ffn_*_exps.weight`` tensors
-  instead of materializing all experts of a layer;
-* applies the architecture exactly as published (RMSNorm, per-head QK-norm
-  before RoPE, GQA attention, softmax router with normalized top-k weights).
-
-It is pure Python, so throughput is far below a native build; the point is
-correct, bounded, verifiable local execution rather than pretending a missing
-kernel exists.
+The executor reads ranges through :class:`~pyrite.stream.BlockStreamer`,
+streams individual experts from stacked 3D tensors, and keeps compact KV state.
+RMSNorm, RoPE, attention, routing, sampling, and most tensor types use the
+Python reference path. Optional portable C kernels fuse dequantization with
+matvec for Q4_K and Q6_K weights; they do not materialize a dequantized matrix.
 """
 from __future__ import annotations
 
 import math
+import sys
+from array import array
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +21,10 @@ from .config import RuntimeConfig
 from .engine import PyriteRuntime
 from .ggml_types import spec as ggml_spec
 from .ggml_types import type_name
+from .kernels.native import dequantize_rows as native_dequantize_rows
+from .kernels.native import matvec as native_matvec
+from .kernels.native import native_available, supports_native
+from .memory import RSSMonitor
 from .qwen3_moe import EXPERT_TENSORS, Qwen3MoECheckpoint, TensorSlice
 from .sampler import Sampler
 from .stream import BlockStreamer
@@ -52,25 +50,60 @@ class ExecutorStats:
     kv_tokens: int = 0
     kv_bytes: int = 0
     kv_budget_bytes: int = 0
+    kv_evictions: int = 0
     bytes_loaded: int = 0
     prefetch_hits: int = 0
     io_seconds: float = 0.0
     decode_seconds: float = 0.0
+    native_kernel_calls: int = 0
+    native_bytes: int = 0
+    native_kernel_seconds: float = 0.0
+    peak_working_set_bytes: int = 0
+    working_set_budget_bytes: int = 0
+    rss_current_bytes: int = 0
+    rss_peak_bytes: int = 0
+    rss_limit_bytes: int = 0
+    rss_current_mb: float = 0.0
+    rss_peak_mb: float = 0.0
+    rss_limit_mb: float = 0.0
+    rss_samples: int = 0
+    rss_unknown: bool = False
+    native_kernel_available: bool = False
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, int | float | bool]:
         return dict(self.__dict__)
 
 
 @dataclass
 class LayerKV:
-    """Per-layer KV cache as flat per-head vectors."""
+    """Compact per-layer fp32 KV vectors with oldest-first eviction."""
 
-    keys: list[list[float]] = field(default_factory=list)
-    values: list[list[float]] = field(default_factory=list)
+    keys: list[array] = field(default_factory=list)
+    values: list[array] = field(default_factory=list)
+    _payload_bytes: int = field(default=0, init=False, repr=False)
+    _vector_overhead: int = field(
+        default=sys.getsizeof(array("f")) + 8,
+        init=False,
+        repr=False,
+    )
 
-    def append(self, key: list[float], value: list[float]) -> None:
-        self.keys.append(key)
-        self.values.append(value)
+    def __post_init__(self) -> None:
+        if len(self.keys) != len(self.values):
+            raise ValueError("KV keys and values must have equal token counts")
+        self._payload_bytes = sum(
+            len(vector) * vector.itemsize for vector in self.keys
+        ) + sum(len(vector) * vector.itemsize for vector in self.values)
+
+    def append(self, key: Sequence[float], value: Sequence[float]) -> None:
+        key_array = array("f", key)
+        value_array = array("f", value)
+        self.keys.append(key_array)
+        try:
+            self.values.append(value_array)
+        except BaseException:
+            self.keys.pop()
+            raise
+        self._payload_bytes += (len(key_array) + len(value_array)) * key_array.itemsize
 
     @property
     def length(self) -> int:
@@ -78,12 +111,32 @@ class LayerKV:
 
     @property
     def byte_size(self) -> int:
-        return sum(len(vector) for vector in self.keys + self.values) * 4
+        return self._payload_bytes
 
-    def truncate(self, max_tokens: int) -> None:
-        if len(self.keys) > max_tokens:
-            del self.keys[: len(self.keys) - max_tokens]
-            del self.values[: len(self.values) - max_tokens]
+    @property
+    def estimated_bytes(self) -> int:
+        # Include array headers and list references in the managed budget;
+        # byte_size intentionally remains the exact fp32 payload for API parity.
+        return self._payload_bytes + self.length * 2 * self._vector_overhead
+
+    def evict_oldest(self, count: int = 1) -> int:
+        if count < 0:
+            raise ValueError("eviction count must be non-negative")
+        removed = min(count, self.length)
+        if removed:
+            removed_bytes = sum(
+                len(vector) * vector.itemsize for vector in self.keys[:removed]
+            ) + sum(len(vector) * vector.itemsize for vector in self.values[:removed])
+            del self.keys[:removed]
+            del self.values[:removed]
+            self._payload_bytes -= removed_bytes
+        return removed
+
+    def truncate(self, max_tokens: int) -> int:
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be non-negative")
+        excess = max(0, self.length - max_tokens)
+        return self.evict_oldest(excess)
 
 
 class _NoTokenizer:
@@ -132,58 +185,105 @@ class Qwen3MoEExecutor:
         self.path = Path(path)
         self.checkpoint = self.CHECKPOINT_CLS(self.path)
         self.checkpoint.validate_contract()
-        self.adapter = GGUFAdapter(self.path)
-        self.prefetch_enabled = prefetch
-        budget = int(resident_bytes) if resident_bytes is not None else self.runtime.config.resident_byte_budget
-        if budget <= 0:
-            raise ValueError("resident_bytes must be positive")
-        self.resident_bytes = budget
-        self.max_tensor_bytes = max_tensor_bytes or budget
+        self.adapter = GGUFAdapter(self.path, reader=self.checkpoint.reader)
+        self.prefetch_enabled = bool(prefetch)
         self.sampler = Sampler(seed=sampler_seed)
-        self.streamer = BlockStreamer(
-            self.adapter,
-            resident_blocks=None,  # the byte budget is authoritative here
-            resident_bytes=budget,
-            workers=workers,
-        )
-        self.stats = ExecutorStats()
-        self._small: dict[str, list[float]] = {}
-        self._cache_small_tensors = cache_small_tensors
-        self._kv: dict[int, LayerKV] = {}
-        self._last_experts: dict[int, tuple[int, ...]] = {}
 
         cfg = self.checkpoint.config
-        kv_bytes = (
+        mib = 1024 * 1024
+        working_set = self.runtime.config.resident_byte_budget
+        if array("f").itemsize != 4:
+            raise RuntimeError("Pyrite requires a 4-byte C float for its compact KV cache")
+        kv_payload_bytes = (
             self.runtime.config.max_kv_tokens
             * cfg.num_hidden_layers
-            * 2  # keys and values
-            * cfg.kv_proj_dim
-            * 4  # fp32 trace
+            * cfg.kv_cache_dim
+            * 4
         )
-        working_set = self.runtime.config.working_set_mb * 1024 * 1024
-        if kv_bytes > working_set:
+        kv_overhead_bytes = (
+            self.runtime.config.max_kv_tokens
+            * cfg.num_hidden_layers
+            * (2 * (sys.getsizeof(array("f")) + 8))
+        )
+        self.kv_budget_bytes = kv_payload_bytes + kv_overhead_bytes
+        self.small_cache_budget_bytes = min(32 * mib, max(1, working_set // 32))
+        self.transient_reserve_bytes = min(64 * mib, max(16 * mib, working_set // 16))
+        available_stream_bytes = (
+            working_set
+            - self.kv_budget_bytes
+            - self.small_cache_budget_bytes
+            - self.transient_reserve_bytes
+        )
+        if available_stream_bytes <= 0:
             raise ValueError(
                 f"KV cache for {self.runtime.config.max_kv_tokens} tokens needs "
-                f"{kv_bytes / 1024 / 1024:.0f} MiB, which does not fit the "
-                f"{self.runtime.config.working_set_mb} MiB working set; lower "
-                "PYRITE_KV_TOKENS or raise PYRITE_RAM_MB"
+                f"{self.kv_budget_bytes / mib:.0f} MiB, leaving no streamed-weight "
+                f"working set inside {self.runtime.config.working_set_mb} MiB; "
+                "lower PYRITE_KV_TOKENS or raise PYRITE_RAM_MB"
             )
-        self.kv_budget_bytes = kv_bytes
-        self.stats.kv_budget_bytes = kv_bytes
+        requested_stream_bytes = (
+            int(resident_bytes) if resident_bytes is not None else available_stream_bytes
+        )
+        if requested_stream_bytes <= 0:
+            raise ValueError("resident_bytes must be positive")
+        self.resident_bytes = min(requested_stream_bytes, available_stream_bytes)
+        if max_tensor_bytes is not None and max_tensor_bytes <= 0:
+            raise ValueError("max_tensor_bytes must be positive when provided")
+        self.max_tensor_bytes = (
+            int(max_tensor_bytes) if max_tensor_bytes is not None else self.resident_bytes
+        )
+        self._cache_small_tensors = cache_small_tensors
+        self._small: dict[str, array] = {}
+        self._small_sizes: dict[str, int] = {}
+        self._small_cache_bytes = 0
+        self._kv: dict[int, LayerKV] = {}
+        self._last_experts: dict[int, tuple[int, ...]] = {}
+        self._closed = False
 
         from .tokenizer import load_gguf_tokenizer
 
         self.tokenizer = load_gguf_tokenizer(self.checkpoint.reader) or _NoTokenizer()
+        self.rss_monitor = RSSMonitor(self.runtime.config.ram_budget_mb * mib)
+        self.streamer = BlockStreamer(
+            self.adapter,
+            resident_blocks=None,
+            resident_bytes=self.resident_bytes,
+            workers=workers,
+            allow_oversized_reads=False,
+        )
+        self.stats = ExecutorStats(
+            kv_budget_bytes=self.kv_budget_bytes,
+            working_set_budget_bytes=working_set,
+            rss_limit_bytes=self.runtime.config.ram_budget_mb * mib,
+            rss_limit_mb=float(self.runtime.config.ram_budget_mb),
+            native_kernel_available=native_available(),
+        )
+        try:
+            self._sample_memory("executor-startup")
+        except BaseException:
+            self._closed = True
+            self.streamer.close()
+            raise
 
     # ------------------------------------------------------------------ helpers
     @property
     def config_(self):
         return self.checkpoint.config
 
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("executor is closed")
+
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self.streamer.close()
+        self._sync_stream_stats()
+        self._sample_memory("executor-close")
 
     def __enter__(self) -> Qwen3MoEExecutor:
+        self._ensure_open()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -208,16 +308,27 @@ class Qwen3MoEExecutor:
 
     def reset_kv(self) -> None:
         """Drop the KV cache so the next token starts a fresh sequence."""
+        self._ensure_open()
         self._kv.clear()
         self._last_experts.clear()
         self._record_kv()
+        self._sample_memory("kv-reset")
 
     def reset(self) -> None:
-        """Drop KV state and reset statistics."""
-        self.stats = ExecutorStats()
-        self.stats.kv_budget_bytes = self.kv_budget_bytes
+        """Drop KV state and reset statistics without resetting the RSS monitor."""
+        self._ensure_open()
         self._kv.clear()
         self._last_experts.clear()
+        self.stats = ExecutorStats(
+            kv_budget_bytes=self.kv_budget_bytes,
+            working_set_budget_bytes=self.runtime.config.resident_byte_budget,
+            rss_limit_bytes=self.runtime.config.ram_budget_mb * 1024 * 1024,
+            rss_limit_mb=float(self.runtime.config.ram_budget_mb),
+            native_kernel_available=native_available(),
+        )
+        self._sync_stream_stats()
+        self._record_kv()
+        self._sample_memory("statistics-reset")
 
     def kv_bytes(self) -> int:
         return sum(cache.byte_size for cache in self._kv.values())
@@ -230,6 +341,39 @@ class Qwen3MoEExecutor:
         self.stats.kv_tokens = max((cache.length for cache in self._kv.values()), default=0)
         self.stats.kv_bytes = self.kv_bytes()
 
+    def _managed_working_set_bytes(self) -> int:
+        stream_bytes = self.streamer.stats().resident_bytes
+        kv_bytes = sum(cache.estimated_bytes for cache in self._kv.values())
+        return stream_bytes + kv_bytes + self._small_cache_bytes
+
+    def _sample_memory(self, stage: str) -> None:
+        current = self.rss_monitor.sample(stage)
+        self.stats.rss_current_bytes = current
+        self.stats.rss_peak_bytes = self.rss_monitor.peak_bytes
+        self.stats.rss_current_mb = current / (1024 * 1024)
+        self.stats.rss_peak_mb = self.rss_monitor.peak_bytes / (1024 * 1024)
+        self.stats.rss_samples = self.rss_monitor.samples
+        self.stats.rss_unknown = self.rss_monitor.unknown
+        managed = self._managed_working_set_bytes()
+        self.stats.peak_working_set_bytes = max(self.stats.peak_working_set_bytes, managed)
+        if managed > self.stats.working_set_budget_bytes:
+            raise MemoryError(
+                f"managed working set reached {managed / (1024 * 1024):.1f} MiB, "
+                f"above budget {self.stats.working_set_budget_bytes / (1024 * 1024):.0f} MiB"
+            )
+
+    def _sync_stream_stats(self) -> None:
+        stream = self.streamer.stats()
+        self.stats.resident_bytes = stream.resident_bytes
+        self.stats.peak_resident_bytes = max(self.stats.peak_resident_bytes, stream.resident_bytes)
+        self.stats.evictions = stream.evictions
+        self.stats.cache_hits = stream.cache_hits
+        self.stats.prefetched = stream.prefetched
+        self.stats.wasted_prefetch_bytes = stream.wasted_prefetch_bytes
+        self.stats.bytes_loaded = stream.bytes_loaded
+        self.stats.prefetch_hits = stream.prefetch_hits
+        self.stats.io_seconds = stream.io_seconds
+
     def _check_size(self, name: str, size: int) -> None:
         if size > self.max_tensor_bytes:
             raise MemoryError(
@@ -237,33 +381,49 @@ class Qwen3MoEExecutor:
                 f"({self.max_tensor_bytes}); raise PYRITE_RAM_MB or stream smaller slices"
             )
 
-    def _block_bytes(self, name: str) -> bytes:
+    def _block_bytes(self, name: str) -> memoryview:
         block_id = f"tensor:{name}"
         block = self.streamer.index.get(block_id)
         if block is None:
             raise KeyError(f"missing tensor: {name}")
         self._check_size(name, block.size)
         self.stats.tensors_streamed += 1
-        payload = bytes(self.streamer.get(block_id))
-        self._after_load()
+        payload = self.streamer.get(block_id)
+        self._after_load("tensor-read")
         return payload
 
-    def _dense_vector(self, name: str) -> list[float]:
-        """Small tensor (norm/router) with a bounded in-process cache."""
+    def _dense_vector(self, name: str) -> Sequence[float]:
+        """Small tensor with a byte-capped compact fp32 LRU cache."""
         if self._cache_small_tensors and name in self._small:
-            return self._small[name]
-        tensor = self.checkpoint.tensor(name)
-        values = self._decode(tensor.ggml_type, self._block_bytes(name), tensor.element_count)
-        if self._cache_small_tensors and tensor.size <= max(64 * 1024, self.max_tensor_bytes // 16):
+            values = self._small.pop(name)
             self._small[name] = values
+            return values
+        tensor = self.checkpoint.tensor(name)
+        values = array(
+            "f", self._decode(tensor.ggml_type, self._block_bytes(name), tensor.element_count)
+        )
+        cached_bytes = len(values) * values.itemsize
+        if (
+            self._cache_small_tensors
+            and cached_bytes <= self.small_cache_budget_bytes
+            and cached_bytes <= max(64 * 1024, self.max_tensor_bytes // 16)
+        ):
+            while self._small and self._small_cache_bytes + cached_bytes > self.small_cache_budget_bytes:
+                oldest = next(iter(self._small))
+                del self._small[oldest]
+                self._small_cache_bytes -= self._small_sizes.pop(oldest)
+            self._small[name] = values
+            self._small_sizes[name] = cached_bytes
+            self._small_cache_bytes += cached_bytes
+        self._sample_memory("small-tensor-decode")
         return values
 
     def _tensor_vector(self, name: str) -> list[float]:
         tensor = self.checkpoint.tensor(name)
         return self._decode(tensor.ggml_type, self._block_bytes(name), tensor.element_count)
 
-    def _decode(self, ggml_type: int, payload: bytes, count: int) -> list[float]:
-        """Decode one tensor payload, timing it for the I/O/decode breakdown."""
+    def _decode(self, ggml_type: int, payload: bytes | memoryview, count: int) -> list[float]:
+        """Reference-decode one tensor payload and record CPU time."""
         started = perf_counter()
         try:
             return decode_vector(ggml_type, payload, count)
@@ -282,8 +442,16 @@ class Qwen3MoEExecutor:
         byte_length = (element_count // block.block_size) * block.bytes_per_block
         return byte_offset, byte_length
 
+    def _read_range(self, name: str, byte_offset: int, byte_length: int) -> memoryview:
+        self._check_size(name, byte_length)
+        block_id = f"tensor:{name}"
+        payload = self.streamer.get_range(block_id, byte_offset, byte_length)
+        self.stats.tensors_streamed += 1
+        self._after_load("weight-range-read")
+        return payload
+
     def _matrix_rows(self, name: str, first_row: int, row_count: int) -> list[list[float]]:
-        """Stream ``row_count`` rows of a 2D ``(cols, rows)`` ggml tensor."""
+        """Stream and decode rows of a 2D GGML tensor with bounded allocation."""
         tensor = self.checkpoint.tensor(name)
         if len(tensor.dims) != 2:
             raise ValueError(f"{name} must be rank-2 for row streaming")
@@ -293,35 +461,136 @@ class Qwen3MoEExecutor:
         if row_count == 0:
             return []
         byte_offset, byte_length = self._row_bytes(name, first_row * cols, row_count * cols)
-        self._check_size(name, byte_length)
-        self.stats.tensors_streamed += 1
-        payload = bytes(self.streamer.get_range(f"tensor:{name}", byte_offset, byte_length))
-        self._after_load()
-        values = self._decode(tensor.ggml_type, payload, row_count * cols)
+        payload = self._read_range(name, byte_offset, byte_length)
+        if supports_native(tensor.ggml_type):
+            started = perf_counter()
+            values = native_dequantize_rows(tensor.ggml_type, payload, row_count, cols)
+            self.stats.native_kernel_calls += 1
+            self.stats.native_bytes += byte_length
+            self.stats.native_kernel_seconds += perf_counter() - started
+        else:
+            values = self._decode(tensor.ggml_type, payload, row_count * cols)
+        self._sample_memory("matrix-row-decode")
         return [values[row * cols:(row + 1) * cols] for row in range(row_count)]
 
-    def _slice_vector(self, layer: int, expert: int, component: str) -> list[float]:
-        slice_: TensorSlice = self.checkpoint.expert_slice(layer, expert, component)
-        self._check_size(slice_.tensor_name, slice_.byte_length)
-        self.stats.tensors_streamed += 1
-        self.stats.expert_slices_streamed += 1
-        payload = bytes(
-            self.streamer.get_range(slice_.block_id, slice_.block_offset, slice_.byte_length)
-        )
-        self._after_load()
-        return self._decode(slice_.ggml_type, payload, slice_.element_count)
+    def _matrix_matvec(
+        self,
+        name: str,
+        first_row: int,
+        row_count: int,
+        vector: Sequence[float],
+    ) -> list[float]:
+        """Read a contiguous row range and multiply without expanding K-quants."""
+        tensor = self.checkpoint.tensor(name)
+        if len(tensor.dims) != 2:
+            raise ValueError(f"{name} must be rank-2 for matrix-vector execution")
+        cols, rows = tensor.dims
+        if len(vector) != cols:
+            raise ValueError(f"matrix/vector shape mismatch for {name}")
+        if first_row < 0 or row_count < 0 or first_row + row_count > rows:
+            raise ValueError(f"row range [{first_row}, {first_row + row_count}) outside {name}")
+        if row_count == 0:
+            return []
+        byte_offset, byte_length = self._row_bytes(name, first_row * cols, row_count * cols)
+        payload = self._read_range(name, byte_offset, byte_length)
+        if supports_native(tensor.ggml_type):
+            started = perf_counter()
+            result = native_matvec(tensor.ggml_type, payload, vector, row_count, cols)
+            self.stats.native_kernel_calls += 1
+            self.stats.native_bytes += byte_length
+            self.stats.native_kernel_seconds += perf_counter() - started
+            return result
+        values = self._decode(tensor.ggml_type, payload, row_count * cols)
+        return self._matvec(values, row_count, cols, vector)
 
-    def _after_load(self) -> None:
-        resident = self.streamer.cache.stats.estimated_bytes
-        self.stats.resident_bytes = resident
-        self.stats.peak_resident_bytes = max(self.stats.peak_resident_bytes, resident)
-        self.stats.evictions = self.streamer.cache.stats.evictions
-        self.stats.cache_hits = self.streamer.cache.stats.hits
-        self.stats.prefetched = self.streamer.prefetched
-        self.stats.wasted_prefetch_bytes = self.streamer.wasted_prefetch_bytes
-        self.stats.bytes_loaded = self.streamer.bytes_loaded
-        self.stats.prefetch_hits = self.streamer.prefetch_hits
-        self.stats.io_seconds = self.streamer.io_seconds
+    def _tensor_matvec(
+        self,
+        name: str,
+        rows: int,
+        cols: int,
+        vector: Sequence[float],
+    ) -> list[float]:
+        """Bounded matrix-vector product, splitting large matrices by rows."""
+        tensor = self.checkpoint.tensor(name)
+        if len(tensor.dims) != 2 or tensor.dims != (cols, rows):
+            raise ValueError(
+                f"{name} has shape {tensor.dims}; expected GGML dimensions {(cols, rows)}"
+            )
+        _, row_bytes = self._row_bytes(name, 0, cols)
+        range_budget = min(self.resident_bytes, self.max_tensor_bytes)
+        if row_bytes > range_budget:
+            raise MemoryError(
+                f"one row of tensor {name!r} needs {row_bytes} bytes, above the "
+                f"streaming range budget ({range_budget} bytes)"
+            )
+        rows_per_chunk = max(1, range_budget // row_bytes)
+        if supports_native(tensor.ggml_type):
+            rows_per_chunk = min(rows_per_chunk, 4096)
+        else:
+            # Python floats and list pointers expand compact GGUF payloads by
+            # much more than 4x.  Cap each reference decode to about 8 MiB of
+            # Python objects even when the file tensor itself is several GB.
+            rows_per_chunk = min(rows_per_chunk, max(1, 262_144 // cols))
+        result: list[float] = []
+        for start in range(0, rows, rows_per_chunk):
+            count = min(rows_per_chunk, rows - start)
+            result.extend(self._matrix_matvec(name, start, count, vector))
+        return result
+
+    def _slice_matvec(
+        self,
+        layer: int,
+        expert: int,
+        component: str,
+        rows: int,
+        cols: int,
+        vector: Sequence[float],
+    ) -> list[float]:
+        """Matvec one expert slice in bounded row ranges (never the full stack)."""
+        slice_: TensorSlice = self.checkpoint.expert_slice(layer, expert, component)
+        if slice_.element_count != rows * cols or len(vector) != cols:
+            raise ValueError(f"expert {component} matrix/vector shape mismatch")
+        block = ggml_spec(slice_.ggml_type)
+        if cols % block.block_size:
+            raise ValueError(
+                f"expert {component} row width {cols} is not aligned to {block.name} blocks"
+            )
+        row_bytes = (cols // block.block_size) * block.bytes_per_block
+        range_budget = min(self.resident_bytes, self.max_tensor_bytes)
+        if row_bytes > range_budget:
+            raise MemoryError(
+                f"one {component} expert row needs {row_bytes} bytes, above the "
+                f"streaming range budget ({range_budget} bytes)"
+            )
+        rows_per_chunk = max(1, range_budget // row_bytes)
+        if supports_native(slice_.ggml_type):
+            rows_per_chunk = min(rows_per_chunk, 4096)
+        else:
+            rows_per_chunk = min(rows_per_chunk, max(1, 262_144 // cols))
+        result: list[float] = []
+        for first in range(0, rows, rows_per_chunk):
+            count = min(rows_per_chunk, rows - first)
+            byte_offset = slice_.block_offset + first * row_bytes
+            byte_length = count * row_bytes
+            self._check_size(slice_.tensor_name, byte_length)
+            payload = self.streamer.get_range(slice_.block_id, byte_offset, byte_length)
+            self.stats.tensors_streamed += 1
+            self.stats.expert_slices_streamed += 1
+            self._after_load("expert-slice-read")
+            if supports_native(slice_.ggml_type):
+                started = perf_counter()
+                result.extend(native_matvec(slice_.ggml_type, payload, vector, count, cols))
+                self.stats.native_kernel_calls += 1
+                self.stats.native_bytes += byte_length
+                self.stats.native_kernel_seconds += perf_counter() - started
+            else:
+                values = self._decode(slice_.ggml_type, payload, count * cols)
+                result.extend(self._matvec(values, count, cols, vector))
+        return result
+
+    def _after_load(self, stage: str = "tensor-read") -> None:
+        self._sync_stream_stats()
+        self._sample_memory(stage)
 
     # ------------------------------------------------------------------- math
     @staticmethod
@@ -397,74 +666,93 @@ class Qwen3MoEExecutor:
 
     def _expert(self, layer: int, expert: int, hidden: Sequence[float]) -> list[float]:
         cfg = self.checkpoint.config
-        gate = self._matvec(self._slice_vector(layer, expert, "gate"), cfg.moe_intermediate_size, cfg.hidden_size, hidden)
-        up = self._matvec(self._slice_vector(layer, expert, "up"), cfg.moe_intermediate_size, cfg.hidden_size, hidden)
+        gate = self._slice_matvec(
+            layer, expert, "gate", cfg.moe_intermediate_size, cfg.hidden_size, hidden
+        )
+        up = self._slice_matvec(
+            layer, expert, "up", cfg.moe_intermediate_size, cfg.hidden_size, hidden
+        )
         act = [s * u for s, u in zip(silu(gate), up, strict=True)]
-        down = self._slice_vector(layer, expert, "down")
-        return self._matvec_transposed(down, cfg.moe_intermediate_size, cfg.hidden_size, act)
+        return self._slice_matvec(
+            layer, expert, "down", cfg.hidden_size, cfg.moe_intermediate_size, act
+        )
 
     def _attention(self, layer: int, hidden: Sequence[float], position: int) -> list[float]:
         cfg = self.checkpoint.config
         head_dim = cfg.head_dim
-        q = self._matvec(self._tensor_vector(f"blk.{layer}.attn_q.weight"), cfg.q_proj_dim, cfg.hidden_size, hidden)
-        k = self._matvec(self._tensor_vector(f"blk.{layer}.attn_k.weight"), cfg.kv_proj_dim, cfg.hidden_size, hidden)
-        v = self._matvec(self._tensor_vector(f"blk.{layer}.attn_v.weight"), cfg.kv_proj_dim, cfg.hidden_size, hidden)
+        value_dim = cfg.value_dim
+        q = self._tensor_matvec(
+            f"blk.{layer}.attn_q.weight", cfg.q_proj_dim, cfg.hidden_size, hidden
+        )
+        k = self._tensor_matvec(
+            f"blk.{layer}.attn_k.weight", cfg.kv_proj_dim, cfg.hidden_size, hidden
+        )
+        v = self._tensor_matvec(
+            f"blk.{layer}.attn_v.weight", cfg.v_proj_dim, cfg.hidden_size, hidden
+        )
 
         # QK-norm exists on Qwen3(-MoE) but not on Llama; apply it only when
-        # the checkpoint carries the tensors.
+        # the checkpoint contract declares and supplies those tensors.
         q_norm_name = f"blk.{layer}.attn_q_norm.weight"
         k_norm_name = f"blk.{layer}.attn_k_norm.weight"
         q_norm = self._dense_vector(q_norm_name) if self.checkpoint.has_tensor(q_norm_name) else None
         k_norm = self._dense_vector(k_norm_name) if self.checkpoint.has_tensor(k_norm_name) else None
         rotary_dim = getattr(cfg, "rotary_dim", head_dim) or head_dim
 
-        def _prep_head(vec: list[float], norm: list[float] | None) -> list[float]:
+        def prep_head(vec: list[float], norm: Sequence[float] | None) -> list[float]:
             if norm is not None:
                 vec = self._rms_norm(vec, norm, cfg.rms_norm_eps)
             return self._rope(vec, position, cfg.rope_theta, rotary_dim)
 
         q_heads = [
-            _prep_head(q[h * head_dim:(h + 1) * head_dim], q_norm)
+            prep_head(q[h * head_dim:(h + 1) * head_dim], q_norm)
             for h in range(cfg.num_attention_heads)
         ]
         k_heads = [
-            _prep_head(k[h * head_dim:(h + 1) * head_dim], k_norm)
+            prep_head(k[h * head_dim:(h + 1) * head_dim], k_norm)
             for h in range(cfg.num_key_value_heads)
         ]
-        v_heads = [v[h * head_dim:(h + 1) * head_dim] for h in range(cfg.num_key_value_heads)]
+        v_heads = [
+            v[h * value_dim:(h + 1) * value_dim]
+            for h in range(cfg.num_key_value_heads)
+        ]
 
         cache = self._kv.setdefault(layer, LayerKV())
-        cache.append([value for head in k_heads for value in head], [value for head in v_heads for value in head])
-        cache.truncate(self.runtime.config.max_kv_tokens)
+        cache.append(
+            [value for head in k_heads for value in head],
+            [value for head in v_heads for value in head],
+        )
+        evicted = cache.truncate(self.runtime.config.max_kv_tokens)
+        if evicted:
+            self.stats.kv_evictions += evicted
         self._record_kv()
+        self._sample_memory("kv-cache-update")
 
         scale = 1.0 / math.sqrt(head_dim)
         group = cfg.kv_heads_per_group
         output: list[float] = []
         for h, query in enumerate(q_heads):
             kv_head = h // group
-            base = kv_head * head_dim
-            keys = cache.keys
-            values = cache.values
-            scores = []
-            for position_index in range(len(keys)):
-                key = keys[position_index][base: base + head_dim]
-                scores.append(sum(a * b for a, b in zip(query, key, strict=True)) * scale)
+            key_base = kv_head * head_dim
+            value_base = kv_head * value_dim
+            scores = [
+                sum(query[i] * key[key_base + i] for i in range(head_dim)) * scale
+                for key in cache.keys
+            ]
             probs = softmax(scores)
-            head_out = [0.0] * head_dim
-            for position_index, weight in enumerate(probs):
+            head_out = [0.0] * value_dim
+            for weight, value in zip(probs, cache.values, strict=True):
                 if weight == 0.0:
                     continue
-                value = values[position_index][base: base + head_dim]
-                for i in range(head_dim):
-                    head_out[i] += weight * value[i]
+                for i in range(value_dim):
+                    head_out[i] += weight * value[value_base + i]
             output.extend(head_out)
         return output
 
     def _moe(self, layer: int, hidden: Sequence[float]) -> list[float]:
         cfg = self.checkpoint.config
-        router = self._matvec(
-            self._tensor_vector(f"blk.{layer}.ffn_gate_inp.weight"),
+        router = self._tensor_matvec(
+            f"blk.{layer}.ffn_gate_inp.weight",
             cfg.num_experts,
             cfg.hidden_size,
             hidden,
@@ -503,10 +791,10 @@ class Qwen3MoEExecutor:
         cfg = self.checkpoint.config
         normed = self._rms_norm(hidden, self._dense_vector(f"blk.{layer}.attn_norm.weight"), cfg.rms_norm_eps)
         attention = self._attention(layer, normed, position)
-        attention = self._matvec(
-            self._tensor_vector(f"blk.{layer}.attn_output.weight"),
+        attention = self._tensor_matvec(
+            f"blk.{layer}.attn_output.weight",
             cfg.hidden_size,
-            cfg.q_proj_dim,
+            cfg.attn_output_dim,
             attention,
         )
         hidden = [a + b for a, b in zip(hidden, attention, strict=True)]
@@ -517,11 +805,27 @@ class Qwen3MoEExecutor:
         self.stats.layers_executed += 1
         return [a + b for a, b in zip(hidden, moe, strict=True)]
 
+    def _context_limit(self) -> int:
+        model_limit = self.checkpoint.config.max_position_embeddings
+        if model_limit <= 0:
+            model_limit = self.runtime.config.max_context_tokens
+        return min(self.runtime.config.max_context_tokens, model_limit)
+
     def logits(self, token_id: int, position: int) -> list[float]:
-        """Forward pass for one token; returns the vocabulary logits."""
+        """Forward one autoregressive token with bounded KV and weight state."""
+        self._ensure_open()
         if position < 0:
             raise ValueError("position must be non-negative")
-        if position >= self.runtime.config.max_kv_tokens:
+        context_limit = self._context_limit()
+        if position >= context_limit:
+            raise MemoryError(
+                f"position {position} exceeds the model/runtime context limit "
+                f"({context_limit})"
+            )
+        if (
+            self.runtime.config.kv_cache_policy == "stop"
+            and position >= self.runtime.config.max_kv_tokens
+        ):
             raise MemoryError(
                 f"position {position} exceeds the configured KV token budget "
                 f"({self.runtime.config.max_kv_tokens})"
@@ -537,16 +841,27 @@ class Qwen3MoEExecutor:
         )
         output_name = "output.weight" if self.checkpoint.has_tensor("output.weight") else "token_embd.weight"
         self.stats.steps += 1
-        # The vocabulary projection is streamed in bounded chunks so a large
-        # output tensor never has to be resident all at once.
-        logits: list[float] = []
-        for start in range(0, self.checkpoint.config.vocab_size, self.OUTPUT_CHUNK_ROWS):
-            count = min(self.OUTPUT_CHUNK_ROWS, self.checkpoint.config.vocab_size - start)
-            rows = self._matrix_rows(output_name, start, count)
-            logits.extend(
-                sum(w * x for w, x in zip(row, hidden, strict=True))
-                for row in rows
+        output_tensor = self.checkpoint.tensor(output_name)
+        output_cols, output_rows = output_tensor.dims
+        _, output_row_bytes = self._row_bytes(output_name, 0, output_cols)
+        range_budget = min(self.resident_bytes, self.max_tensor_bytes)
+        if output_row_bytes > range_budget:
+            raise MemoryError(
+                f"one output row needs {output_row_bytes} bytes, above the streaming "
+                f"range budget ({range_budget} bytes)"
             )
+        output_chunk_rows = min(
+            self.OUTPUT_CHUNK_ROWS,
+            max(1, range_budget // output_row_bytes),
+        )
+        if not supports_native(output_tensor.ggml_type):
+            output_chunk_rows = min(output_chunk_rows, max(1, 262_144 // output_cols))
+        logits: list[float] = []
+        for start in range(0, output_rows, output_chunk_rows):
+            count = min(output_chunk_rows, output_rows - start)
+            logits.extend(self._matrix_matvec(output_name, start, count, hidden))
+        self._sync_stream_stats()
+        self._sample_memory("token-forward-complete")
         return logits
 
     # ------------------------------------------------------------ public entry
@@ -559,30 +874,49 @@ class Qwen3MoEExecutor:
         stop_ids: Sequence[int] | None = None,
     ) -> list[int]:
         """InferenceBackend-compatible greedy/sampled decoding."""
+        self._ensure_open()
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be non-negative")
         if not input_ids:
             raise ValueError("input_ids must contain at least one token")
+        if not math.isfinite(temperature) or temperature < 0:
+            raise ValueError("temperature must be finite and non-negative")
+        if not math.isfinite(top_p) or not 0.0 < top_p <= 1.0:
+            raise ValueError("top_p must be finite and in (0, 1]")
+        if any(not isinstance(token, int) or not 0 <= token < self.checkpoint.config.vocab_size for token in input_ids):
+            raise ValueError("input token id is outside the checkpoint vocabulary")
         # Every call decodes a fresh sequence: stale KV entries from an earlier
         # prompt would otherwise leak into the attention context.
         self.reset_kv()
+        if max_new_tokens == 0:
+            return list(input_ids)
         self.ensure_decodable()
         stops = set(stop_ids if stop_ids is not None else ())
         if self.checkpoint.config.eos_token_id is not None:
             stops.add(self.checkpoint.config.eos_token_id)
+        if any(not isinstance(token, int) or not 0 <= token < self.checkpoint.config.vocab_size for token in stops):
+            raise ValueError("stop token id is outside the checkpoint vocabulary")
 
+        context_limit = self._context_limit()
+        if len(input_ids) > context_limit:
+            raise MemoryError(
+                f"prompt has {len(input_ids)} tokens, above context limit {context_limit}"
+            )
         max_kv = self.runtime.config.max_kv_tokens
+        if self.runtime.config.kv_cache_policy == "stop" and len(input_ids) > max_kv:
+            raise MemoryError("prompt exceeds the configured KV token budget")
+
         position = 0
         generated = list(input_ids)
         logits: list[float] = []
         for token_id in input_ids:
-            if position >= max_kv:
-                raise MemoryError("prompt exceeds the configured KV token budget")
             logits = self.logits(token_id, position)
             position += 1
 
         for _ in range(max_new_tokens):
-            if position >= max_kv:
+            if position >= context_limit:
+                break
+            if self.runtime.config.kv_cache_policy == "stop" and position >= max_kv:
                 break
             next_token = self.sampler.sample(logits, temperature, top_p)
             generated.append(next_token)
@@ -590,6 +924,8 @@ class Qwen3MoEExecutor:
                 break
             logits = self.logits(next_token, position)
             position += 1
+        self._sync_stream_stats()
+        self._sample_memory("generation-complete")
         return generated
 
     def generate_text(
@@ -600,6 +936,7 @@ class Qwen3MoEExecutor:
         top_p: float = 1.0,
     ) -> dict[str, object]:
         """Tokenize, generate and decode; returns text plus token accounting."""
+        self._ensure_open()
         if isinstance(self.tokenizer, _NoTokenizer):
             raise RuntimeError(  # checkpoint state, not a bad argument type
                 "checkpoint has no byte-level BPE tokenizer; pass token ids to generate() instead"
@@ -623,7 +960,9 @@ class Qwen3MoEExecutor:
         total_bytes = sum(tensor.size for tensor in self.checkpoint.reader.tensor_index())
         return {
             "path": str(self.path),
-            "architecture": "qwen3moe",
+            "architecture": str(
+                self.checkpoint.metadata.get("general.architecture", "qwen3moe")
+            ),
             "layers": cfg.num_hidden_layers,
             "hidden_size": cfg.hidden_size,
             "experts": cfg.num_experts,
@@ -631,8 +970,14 @@ class Qwen3MoEExecutor:
             "vocab_size": cfg.vocab_size,
             "tensor_count": self.checkpoint.tensor_count,
             "total_bytes": total_bytes,
-            "resident_budget_bytes": self.runtime.config.resident_byte_budget,
+            "resident_budget_bytes": self.resident_bytes,
+            "working_set_budget_bytes": self.runtime.config.resident_byte_budget,
+            "rss_limit_bytes": self.runtime.config.ram_budget_mb * 1024 * 1024,
             "kv_budget_bytes": self.kv_budget_bytes,
+            "kv_cache_policy": self.runtime.config.kv_cache_policy,
+            "cpu_execution": True,
+            "native_kernel_available": native_available(),
+            "native_kernel_types": ["Q4_K", "Q6_K"] if native_available() else [],
             "unsupported_tensor_types": list(self.unsupported_tensor_types()),
             "tokenizer": type(self.tokenizer).__name__,
         }

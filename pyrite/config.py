@@ -23,6 +23,9 @@ class RuntimeConfig:
     prefetch_depth: int = 2
     resident_blocks: int = 2
     offline: bool = True
+    # stop preserves the prompt exactly and ends at the KV limit; sliding_window
+    # evicts oldest KV entries and continues within max_context_tokens.
+    kv_cache_policy: str = "stop"
 
     def __post_init__(self) -> None:
         # Accept strings for storage_dir from JSON/env profiles.
@@ -38,6 +41,22 @@ class RuntimeConfig:
         return self.working_set_mb * 1024 * 1024
 
     def validate(self) -> None:
+        integer_fields = (
+            "ram_budget_mb",
+            "reserve_mb",
+            "max_context_tokens",
+            "max_kv_tokens",
+            "prefetch_depth",
+            "resident_blocks",
+        )
+        for name in integer_fields:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+        if not isinstance(self.offline, bool):
+            raise ValueError("offline must be a boolean")
+        if not isinstance(self.kv_cache_policy, str):
+            raise ValueError("kv_cache_policy must be a string")
         if self.ram_budget_mb < 1024:
             raise ValueError("ram_budget_mb must be at least 1024")
         if self.reserve_mb < 0:
@@ -56,6 +75,8 @@ class RuntimeConfig:
             raise ValueError("max_kv_tokens must be positive")
         if self.max_kv_tokens > self.max_context_tokens:
             raise ValueError("max_kv_tokens cannot exceed max_context_tokens")
+        if self.kv_cache_policy not in {"stop", "sliding_window"}:
+            raise ValueError("kv_cache_policy must be 'stop' or 'sliding_window'")
 
     def to_dict(self) -> dict[str, object]:
         data = asdict(self)
@@ -127,4 +148,5 @@ class RuntimeConfig:
             prefetch_depth=number("PYRITE_PREFETCH", base.prefetch_depth),
             resident_blocks=number("PYRITE_RESIDENT_BLOCKS", base.resident_blocks),
             offline=source.get("PYRITE_OFFLINE", "1" if base.offline else "0") != "0",
+            kv_cache_policy=source.get("PYRITE_KV_POLICY", base.kv_cache_policy),
         )

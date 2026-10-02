@@ -101,10 +101,45 @@ def test_generate_refuses_unsupported_quantization(capsys, tmp_path: Path, monke
         vocab_size=271,
     )
     path, _cfg, _ = build_tiny_checkpoint(tmp_path / "unsupported.gguf", config, ggml_type=35)
+    check_code, report = _run(capsys, ["qwen3-check", str(path)])
+    assert check_code == 0
+    assert report["routing"]["native_generation_ready"] is False
+    assert report["routing"]["unsupported_tensor_types"] == ["TQ2_0"]
+
     code = main(["generate", str(path), "--prompt", "hello", "--max-new-tokens", "1"])
     captured = capsys.readouterr()
     assert code == 3
     assert "without a reference decoder" in captured.err
+
+
+def test_qwen3_check_rejects_a_noncanonical_moe_when_required(capsys, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("PYRITE_MODEL_DIR", str(tmp_path / "store"))
+    path, _, _ = build_tiny_checkpoint(tmp_path / "tiny.gguf")
+    code = main(["qwen3-check", str(path), "--require-canonical"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "94 layers, 128 experts, top-8" in captured.err
+
+
+def test_qwen3_check_reports_dense_qwen3(capsys, tmp_path: Path, monkeypatch):
+    from .tiny_dense import build_tiny_dense_checkpoint, qwen3_dense_config
+
+    monkeypatch.setenv("PYRITE_MODEL_DIR", str(tmp_path / "store"))
+    path, _, _ = build_tiny_dense_checkpoint(
+        tmp_path / "dense.gguf", qwen3_dense_config()
+    )
+    code, payload = _run(capsys, ["qwen3-check", str(path), "--full"])
+    assert code == 0
+    assert payload["model"] == "Qwen3 dense"
+    assert payload["architecture"] == "qwen3"
+    assert payload["streaming"]["can_stream_storage"] is True
+
+
+def test_cli_reports_a_non_object_profile_without_a_traceback(capsys, tmp_path: Path):
+    profile = tmp_path / "bad-profile.json"
+    profile.write_text("[]", encoding="utf-8")
+    assert main(["--profile", str(profile), "status"]) == 2
+    assert "runtime profile must be a JSON object" in capsys.readouterr().err
 
 
 def test_qwen3_check_rejects_a_non_checkpoint(capsys, tmp_path: Path, monkeypatch):

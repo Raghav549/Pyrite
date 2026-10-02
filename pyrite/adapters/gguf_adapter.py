@@ -12,9 +12,11 @@ class GGUFAdapter:
 
     name = "gguf"
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, reader: GGUFReader | None = None):
         self.path = Path(path)
-        self.reader = GGUFReader(self.path)
+        self.reader = reader or GGUFReader(self.path)
+        if self.reader.path != self.path:
+            raise ValueError("GGUF reader belongs to a different checkpoint")
 
     def blocks(self) -> list[WeightBlock]:
         return [

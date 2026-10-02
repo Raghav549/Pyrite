@@ -6,5 +6,6 @@
   "max_kv_tokens": 1536,
   "resident_blocks": 2,
   "prefetch_depth": 2,
-  "offline": true
+  "offline": true,
+  "kv_cache_policy": "stop"
 }

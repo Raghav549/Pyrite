@@ -262,7 +262,7 @@ def q3_k_vector(data: bytes, count: int) -> list[float]:
         raw = data[pos + 96: pos + 108]
         pos += 110
 
-        aux = list(struct.unpack("<4I", raw + b"\0\0\0\0"))
+        aux = list(struct.unpack("<4I", bytes(raw) + b"\0\0\0\0"))
         tmp = aux[2]
         aux[2] = ((aux[0] >> 4) & mask2) | (((tmp >> 4) & mask1) << 4)
         aux[3] = ((aux[1] >> 4) & mask2) | (((tmp >> 6) & mask1) << 4)

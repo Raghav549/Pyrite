@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from pyrite.config import RuntimeConfig
-from pyrite.dense import DenseCheckpoint, DenseContractError, DenseExecutor
+from pyrite.dense import DenseCheckpoint, DenseConfig, DenseContractError, DenseExecutor
 from pyrite.engine import PyriteRuntime
 from pyrite.executor import detect_architecture, open_executor
 
@@ -41,11 +41,29 @@ def test_dense_contract_rejects_unknown_architectures(tmp_path: Path):
     meta = DenseCheckpoint(path).metadata
     builder = GGUFFileBuilder("qwen3moe")
     for key, value in meta.items():
-        if key != "general.architecture":
+        if key not in {"general.architecture", "general.alignment"}:
             builder.add(key, value)
     bad = builder.write(tmp_path / "bad.gguf")
     with pytest.raises(DenseContractError):
         DenseCheckpoint(bad)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("qwen3.attention.head_count_kv", 0),
+        ("qwen3.attention.layer_norm_rms_epsilon", 0.0),
+        ("qwen3.rope.freq_base", 0.0),
+    ],
+)
+def test_dense_metadata_does_not_replace_explicit_zero_with_a_default(
+    tmp_path: Path, key: str, value: object
+):
+    path, _, _ = build_tiny_dense_checkpoint(tmp_path / "dense.gguf", qwen3_dense_config())
+    metadata = DenseCheckpoint(path).metadata
+    metadata[key] = value
+    with pytest.raises(DenseContractError):
+        DenseConfig.from_metadata(metadata)
 
 
 def test_dense_contract_rejects_missing_tensors(tmp_path: Path):
@@ -176,7 +194,12 @@ def test_dense_q8_0_execution_uses_real_quantized_weights(tmp_path: Path):
     converted = 0
     for tensor in reader.tensor_index():
         payload = reader.read_tensor(tensor)
-        if tensor.ggml_type == 0 and tensor.element_count > 0 and tensor.element_count % 32 == 0:
+        if (
+            tensor.ggml_type == 0
+            and tensor.element_count > 0
+            and tensor.dims[0] % 32 == 0
+            and tensor.element_count % 32 == 0
+        ):
             array = np.frombuffer(payload, dtype=np.float32).copy()
             payload = quants.quantize(array, quants.GGMLQuantizationType.Q8_0).tobytes()
             builder.add_tensor(tensor.name, tensor.dims, 8, payload)

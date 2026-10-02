@@ -269,6 +269,17 @@ def test_logits_refuses_positions_past_the_kv_budget(tmp_path: Path):
             executor.logits(1, 4)
 
 
+def test_closed_executor_refuses_new_generation(tmp_path: Path):
+    path, _, _ = build_tiny_checkpoint(tmp_path / "tiny.gguf")
+    executor = Qwen3MoEExecutor(path, runtime=_runtime())
+    executor.close()
+    executor.close()  # close remains idempotent
+    with pytest.raises(RuntimeError, match="executor is closed"):
+        executor.generate([], max_new_tokens=-1)
+    with pytest.raises(RuntimeError, match="executor is closed"):
+        executor.generate_text("", max_new_tokens=-1)
+
+
 def test_kv_trace_larger_than_the_working_set_is_rejected(tmp_path: Path):
     path, _cfg, _ = build_tiny_checkpoint(tmp_path / "tiny.gguf")
     runtime = PyriteRuntime(
@@ -291,3 +302,22 @@ def test_kv_budget_is_enforced(tmp_path: Path):
         assert len(executor.generate([1], max_new_tokens=10, temperature=0.0)) == 3
         with pytest.raises(MemoryError):
             executor.generate([1, 2, 3, 4], max_new_tokens=1, temperature=0.0)
+
+
+def test_sliding_window_evicts_old_kv_and_continues(tmp_path: Path):
+    path, cfg, _ = build_tiny_checkpoint(tmp_path / "tiny.gguf")
+    runtime = PyriteRuntime(
+        RuntimeConfig(
+            ram_budget_mb=1024,
+            reserve_mb=768,
+            max_kv_tokens=2,
+            max_context_tokens=8,
+            kv_cache_policy="sliding_window",
+        )
+    )
+    with Qwen3MoEExecutor(path, runtime=runtime) as executor:
+        output = executor.generate([1, 2], max_new_tokens=4, temperature=0.0)
+        assert len(output) == 6
+        assert executor.kv_tokens() == 2
+        # Six tokens were forwarded per layer; the oldest four were removed.
+        assert executor.stats.kv_evictions == cfg.num_hidden_layers * 4

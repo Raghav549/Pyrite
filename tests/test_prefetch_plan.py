@@ -103,6 +103,25 @@ def test_prefetch_ranges_hit_and_miss(tmp_path: Path):
             stream.prefetch_ranges([("a", 0, 8)], confidence=-1.0)
 
 
+def test_range_reads_reuse_a_cached_whole_block(tmp_path: Path):
+    adapter = _shards(tmp_path, {"a": 256})
+    expected = bytes([len("a") % 251]) * 32
+    with BlockStreamer(adapter, resident_blocks=4, resident_bytes=512) as stream:
+        stream.get("a")
+        assert bytes(stream.get_range("a", 64, 32)) == expected
+        assert stream.stats().loads == 1
+
+
+def test_range_read_consumes_a_full_block_prefetch(tmp_path: Path):
+    adapter = _shards(tmp_path, {"a": 256})
+    expected = bytes([len("a") % 251]) * 32
+    with BlockStreamer(adapter, resident_blocks=4, resident_bytes=512, workers=1) as stream:
+        stream.prefetch(["a"])
+        assert bytes(stream.get_range("a", 64, 32)) == expected
+        assert stream.stats().loads == 1
+        assert stream.stats().prefetch_hits == 1
+
+
 def test_oversized_range_is_usable_but_never_cached(tmp_path: Path):
     adapter = _shards(tmp_path, {"big": 1024})
     with BlockStreamer(adapter, resident_blocks=8, resident_bytes=128, workers=1) as stream:

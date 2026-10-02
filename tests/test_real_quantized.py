@@ -58,6 +58,7 @@ def requantize_checkpoint(src: Path, dst: Path, qtype_name: str, ggml_type: int)
         if (
             tensor.ggml_type == 0
             and tensor.element_count > 0
+            and tensor.dims[0] % SIMPLE_BLOCK == 0
             and tensor.element_count % SIMPLE_BLOCK == 0
         ):
             array = np.frombuffer(payload, dtype=np.float32).copy()

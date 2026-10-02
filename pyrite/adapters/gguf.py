@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..ggml_types import row_size
 from ..ggml_types import spec as ggml_spec
-from ..ggml_types import tensor_size
 
 
 @dataclass(frozen=True)
@@ -190,6 +190,8 @@ class GGUFReader:
             alignment = self.DEFAULT_ALIGNMENT
             for _ in range(metadata_count):
                 key, value_type = r.string(), r.u32()
+                if key in metadata:
+                    raise ValueError(f"duplicate GGUF metadata key: {key}")
                 value = self._read_value(r, value_type)
                 metadata[key] = value
                 if key == "general.alignment":
@@ -204,9 +206,11 @@ class GGUFReader:
                 if name in seen:
                     raise ValueError(f"duplicate GGUF tensor name: {name}")
                 seen.add(name)
-                if n_dims > 8:
-                    raise ValueError(f"GGUF tensor {name!r} has too many dimensions")
+                if n_dims == 0 or n_dims > 8:
+                    raise ValueError(f"GGUF tensor {name!r} has invalid dimension count: {n_dims}")
                 dims = tuple(r.u64() for _ in range(n_dims))
+                if any(dim == 0 for dim in dims):
+                    raise ValueError(f"GGUF tensor {name!r} has a zero-sized dimension")
                 descriptors.append((name, dims, r.u32(), r.u64()))
 
             position = fh.tell()
@@ -215,19 +219,29 @@ class GGUFReader:
                 if tensor_count
                 else position
             )
+            if data_offset > size:
+                raise ValueError("GGUF tensor data starts beyond end of file")
             tensors: list[GGUFTensor] = []
-            for index, (name, dims, ggml_type, relative_offset) in enumerate(descriptors):
+            extents: list[tuple[int, int, str]] = []
+            for name, dims, ggml_type, relative_offset in descriptors:
                 if relative_offset % alignment:
                     raise ValueError(f"unaligned GGUF tensor offset: {name}")
                 tensor_bytes = self._tensor_size(dims, ggml_type, name)
                 absolute = data_offset + relative_offset
-                if absolute + tensor_bytes > size:
+                end = absolute + tensor_bytes
+                if end > size:
                     raise ValueError(f"GGUF tensor extends beyond file: {name}")
-                if index + 1 < len(descriptors):
-                    following = data_offset + descriptors[index + 1][3]
-                    if following < absolute:
-                        raise ValueError("GGUF tensor offsets are not monotonic")
                 tensors.append(GGUFTensor(name, dims, ggml_type, absolute, tensor_bytes))
+                extents.append((absolute, end, name))
+            previous_end = data_offset
+            previous_name = ""
+            for start, end, name in sorted(extents):
+                if start < previous_end:
+                    raise ValueError(
+                        f"GGUF tensor payload overlaps another tensor: {previous_name}, {name}"
+                    )
+                previous_end = end
+                previous_name = name
 
         self._header = GGUFHeader(version, tensor_count, metadata_count, alignment, data_offset)
         self._metadata = metadata
@@ -244,7 +258,11 @@ class GGUFReader:
         if value_type == self.TYPE_UINT32: return r.u32()
         if value_type == self.TYPE_INT32: return r.i32()
         if value_type == self.TYPE_FLOAT32: return r.f32()
-        if value_type == self.TYPE_BOOL: return bool(r.u8())
+        if value_type == self.TYPE_BOOL:
+            value = r.u8()
+            if value not in (0, 1):
+                raise ValueError(f"invalid GGUF boolean value: {value}")
+            return bool(value)
         if value_type == self.TYPE_STRING: return r.string()
         if value_type == self.TYPE_ARRAY:
             element_type, count = r.u32(), r.u64()
@@ -259,17 +277,15 @@ class GGUFReader:
     @staticmethod
     def _tensor_size(dims: tuple[int, ...], ggml_type: int, name: str = "") -> int:
         if not dims:
-            return 0
-        elements = 1
-        for dim in dims:
-            if dim < 0:
-                raise ValueError("GGUF tensor dimensions cannot be negative")
-            if dim == 0:
-                return 0
-            elements *= dim
+            raise ValueError("GGUF tensor must have at least one dimension")
+        if any(dim <= 0 for dim in dims):
+            raise ValueError("GGUF tensor dimensions must be positive")
+        rows = 1
+        for dim in dims[1:]:
+            rows *= dim
         try:
-            return tensor_size(elements, ggml_type)
-        except ValueError as exc:
+            return row_size(dims[0], ggml_type) * rows
+        except (TypeError, ValueError) as exc:
             label = f"tensor {name!r}: " if name else ""
             raise ValueError(f"{label}{exc}") from exc
 

@@ -10,18 +10,22 @@ metadata keys follow the published GGUF contract used by llama.cpp::
 
 :class:`DenseExecutor` reuses the streaming engine, KV cache, sampler and
 reference decoders of :class:`pyrite.executor.Qwen3MoEExecutor`; only the
-feed-forward block (dense SwiGLU instead of routed experts) differs.  Like the
-MoE path it is a correctness reference in pure Python, not a
-throughput-optimized kernel.
+feed-forward block (dense SwiGLU instead of routed experts) differs.  It uses
+the optional native Q4_K/Q6_K matvec kernels when they are available; the
+remaining transformer operations use the Python reference path.
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from .adapters.gguf import GGUFReader, GGUFTensor
 from .executor import Qwen3MoEExecutor
+from .ggml_types import type_name
+from .kernels.native import native_available
+from .tensor_ops import DECODABLE_TYPES
 
 ARCHITECTURES = ("qwen3", "llama")
 
@@ -63,6 +67,18 @@ class DenseConfig:
         return self.num_key_value_heads * self.head_dim
 
     @property
+    def v_proj_dim(self) -> int:
+        return self.num_key_value_heads * self.value_dim
+
+    @property
+    def attn_output_dim(self) -> int:
+        return self.num_attention_heads * self.value_dim
+
+    @property
+    def kv_cache_dim(self) -> int:
+        return self.num_key_value_heads * (self.head_dim + self.value_dim)
+
+    @property
     def kv_heads_per_group(self) -> int:
         return max(1, self.num_attention_heads // max(1, self.num_key_value_heads))
 
@@ -81,27 +97,37 @@ class DenseConfig:
         hidden = int(n("embedding_length", 0) or 0)
         layers = int(n("block_count", 0) or 0)
         heads = int(n("attention.head_count", 0) or 0)
-        kv_heads = int(n("attention.head_count_kv", heads) or heads)
+        raw_kv_heads = n("attention.head_count_kv", None)
+        kv_heads = heads if raw_kv_heads is None else int(raw_kv_heads)
         intermediate = int(n("feed_forward_length", 0) or 0)
-        head_dim = int(n("attention.key_length", hidden // max(1, heads)) or 0)
-        value_dim = int(n("attention.value_length", head_dim) or 0)
-        rotary_dim = int(n("rope.dimension_count", head_dim) or 0)
+        raw_head_dim = n("attention.key_length", None)
+        head_dim = int(hidden // heads if raw_head_dim is None and heads else raw_head_dim or 0)
+        raw_value_dim = n("attention.value_length", None)
+        value_dim = int(head_dim if raw_value_dim is None else raw_value_dim)
+        raw_rotary_dim = n("rope.dimension_count", None)
+        rotary_dim = int(head_dim if raw_rotary_dim is None else raw_rotary_dim)
         vocab = _resolve_vocab_size(metadata, arch)
-        eps = float(n("attention.layer_norm_rms_epsilon", _RMS_EPS[arch]) or _RMS_EPS[arch])
-        rope_theta = float(n("rope.freq_base", _ROPE_THETA[arch]) or _ROPE_THETA[arch])
+        raw_eps = n("attention.layer_norm_rms_epsilon", None)
+        eps = float(_RMS_EPS[arch] if raw_eps is None else raw_eps)
+        raw_rope_theta = n("rope.freq_base", None)
+        rope_theta = float(_ROPE_THETA[arch] if raw_rope_theta is None else raw_rope_theta)
         max_pos = int(n("context_length", 0) or 0)
         bos = get("tokenizer.ggml.bos_token_id")
         eos = get("tokenizer.ggml.eos_token_id")
-        tied = bool(n("tied_word_embeddings", False))
-        qk_norm = bool(n("attention.qk_norm", arch == "qwen3"))
+        tied = _metadata_bool(n("tied_word_embeddings"), False, "tied_word_embeddings")
+        qk_norm = _metadata_bool(n("attention.qk_norm"), arch == "qwen3", "attention.qk_norm")
 
         required = (hidden, layers, heads, kv_heads, intermediate, vocab, head_dim)
         if any(value <= 0 for value in required):
             raise DenseContractError(f"GGUF is missing required {arch} metadata")
-        if heads % kv_heads:
+        if kv_heads > heads or heads % kv_heads:
             raise DenseContractError("attention head count must be divisible by KV head count")
-        if value_dim <= 0 or rotary_dim <= 0 or rotary_dim > head_dim:
+        if value_dim <= 0 or rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2:
             raise DenseContractError("attention value/rotary dimensions are invalid")
+        if not math.isfinite(eps) or eps <= 0:
+            raise DenseContractError("RMSNorm epsilon must be finite and positive")
+        if not math.isfinite(rope_theta) or rope_theta <= 0:
+            raise DenseContractError("RoPE frequency base must be finite and positive")
 
         return cls(
             architecture=arch,
@@ -127,11 +153,21 @@ class DenseConfig:
         return dict(self.__dict__)
 
 
+def _metadata_bool(value: object, default: bool, name: str) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise DenseContractError(f"{name} metadata must be a boolean")
+
+
 def _resolve_vocab_size(metadata: Mapping[str, object], arch: str) -> int:
     explicit = metadata.get(f"{arch}.vocab_size")
     tokens = metadata.get("tokenizer.ggml.tokens")
     token_count = len(tokens) if isinstance(tokens, (list, tuple)) and tokens else 0
-    if explicit:
+    if explicit is not None:
         if token_count and int(explicit) != token_count:
             raise DenseContractError(
                 f"{arch}.vocab_size is {int(explicit)} but the tokenizer carries "
@@ -141,7 +177,7 @@ def _resolve_vocab_size(metadata: Mapping[str, object], arch: str) -> int:
     if token_count:
         return token_count
     legacy = metadata.get("tokenizer.ggml.vocab_size")
-    if legacy:
+    if legacy is not None:
         return int(legacy)
     return 0
 
@@ -162,9 +198,11 @@ class DenseCheckpoint:
         "ffn_down.weight",
     )
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, reader: GGUFReader | None = None):
         self.path = Path(path)
-        self.reader = GGUFReader(self.path)
+        self.reader = reader or GGUFReader(self.path)
+        if self.reader.path != self.path:
+            raise ValueError("GGUF reader belongs to a different checkpoint")
         self.metadata = self.reader.metadata()
         self.config = DenseConfig.from_metadata(self.metadata)
         self._tensors = {tensor.name: tensor for tensor in self.reader.tensor_index()}
@@ -199,30 +237,41 @@ class DenseCheckpoint:
         require("output_norm.weight", (cfg.hidden_size,))
         if "output.weight" in self._tensors:
             require("output.weight", (cfg.hidden_size, cfg.vocab_size))
+        elif not cfg.tie_word_embeddings:
+            problems.append("missing tensor: output.weight (checkpoint does not declare tied embeddings)")
 
         for layer in range(cfg.num_hidden_layers):
             prefix = f"blk.{layer}."
             require(prefix + "attn_norm.weight", (cfg.hidden_size,))
             require(prefix + "attn_q.weight", (cfg.hidden_size, cfg.q_proj_dim))
             require(prefix + "attn_k.weight", (cfg.hidden_size, cfg.kv_proj_dim))
-            require(prefix + "attn_v.weight", (cfg.hidden_size, cfg.value_dim * cfg.num_key_value_heads))
-            require(prefix + "attn_output.weight", (cfg.q_proj_dim, cfg.hidden_size))
+            require(prefix + "attn_v.weight", (cfg.hidden_size, cfg.v_proj_dim))
+            require(prefix + "attn_output.weight", (cfg.attn_output_dim, cfg.hidden_size))
             require(prefix + "ffn_norm.weight", (cfg.hidden_size,))
             require(prefix + "ffn_gate.weight", (cfg.hidden_size, cfg.intermediate_size))
             require(prefix + "ffn_up.weight", (cfg.hidden_size, cfg.intermediate_size))
             require(prefix + "ffn_down.weight", (cfg.intermediate_size, cfg.hidden_size))
             for norm in ("attn_q_norm.weight", "attn_k_norm.weight"):
-                if prefix + norm in self._tensors:
+                if cfg.has_qk_norm or prefix + norm in self._tensors:
                     require(prefix + norm, (cfg.head_dim,))
 
         if problems:
             raise DenseContractError(
                 f"{cfg.architecture} GGUF contract violated:\n  - " + "\n  - ".join(problems[:20])
             )
+        unsupported_types = sorted(
+            {
+                type_name(tensor.ggml_type)
+                for tensor in self._tensors.values()
+                if tensor.ggml_type not in DECODABLE_TYPES
+            }
+        )
         return {
             "architecture": cfg.architecture,
             "layers": cfg.num_hidden_layers,
-            "native_generation_ready": True,
+            "unsupported_tensor_types": unsupported_types,
+            "tensor_types_decodable": not unsupported_types,
+            "native_generation_ready": not unsupported_types,
         }
 
 
@@ -263,28 +312,34 @@ class DenseExecutor(Qwen3MoEExecutor):
         from .tensor_ops import silu
 
         cfg = self.checkpoint.config
-        gate = self._matvec(
-            self._tensor_vector(f"blk.{layer}.ffn_gate.weight"),
-            cfg.intermediate_size, cfg.hidden_size, hidden,
+        gate = self._tensor_matvec(
+            f"blk.{layer}.ffn_gate.weight",
+            cfg.intermediate_size,
+            cfg.hidden_size,
+            hidden,
         )
-        up = self._matvec(
-            self._tensor_vector(f"blk.{layer}.ffn_up.weight"),
-            cfg.intermediate_size, cfg.hidden_size, hidden,
+        up = self._tensor_matvec(
+            f"blk.{layer}.ffn_up.weight",
+            cfg.intermediate_size,
+            cfg.hidden_size,
+            hidden,
         )
         act = [s * u for s, u in zip(silu(gate), up, strict=True)]
-        return self._matvec(
-            self._tensor_vector(f"blk.{layer}.ffn_down.weight"),
-            cfg.hidden_size, cfg.intermediate_size, act,
+        return self._tensor_matvec(
+            f"blk.{layer}.ffn_down.weight",
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            act,
         )
 
     def _layer(self, layer: int, hidden: list[float], position: int) -> list[float]:
         cfg = self.checkpoint.config
         normed = self._rms_norm(hidden, self._dense_vector(f"blk.{layer}.attn_norm.weight"), cfg.rms_norm_eps)
         attention = self._attention(layer, normed, position)
-        attention = self._matvec(
-            self._tensor_vector(f"blk.{layer}.attn_output.weight"),
+        attention = self._tensor_matvec(
+            f"blk.{layer}.attn_output.weight",
             cfg.hidden_size,
-            cfg.q_proj_dim,
+            cfg.attn_output_dim,
             attention,
         )
         hidden = [a + b for a, b in zip(hidden, attention, strict=True)]
@@ -307,8 +362,14 @@ class DenseExecutor(Qwen3MoEExecutor):
             "vocab_size": cfg.vocab_size,
             "tensor_count": self.checkpoint.tensor_count,
             "total_bytes": total_bytes,
-            "resident_budget_bytes": self.runtime.config.resident_byte_budget,
+            "resident_budget_bytes": self.resident_bytes,
+            "working_set_budget_bytes": self.runtime.config.resident_byte_budget,
+            "rss_limit_bytes": self.runtime.config.ram_budget_mb * 1024 * 1024,
             "kv_budget_bytes": self.kv_budget_bytes,
+            "kv_cache_policy": self.runtime.config.kv_cache_policy,
+            "cpu_execution": True,
+            "native_kernel_available": native_available(),
+            "native_kernel_types": ["Q4_K", "Q6_K"] if native_available() else [],
             "unsupported_tensor_types": list(self.unsupported_tensor_types()),
             "tokenizer": type(self.tokenizer).__name__,
         }

@@ -15,6 +15,7 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
+from .config import RuntimeConfig
 from .engine import PyriteRuntime
 from .memory import process_memory_mb
 
@@ -86,8 +87,10 @@ def machine_info() -> dict[str, object]:
     }
 
 
-def _policy_benchmark(prompt: str, blocks: int) -> dict[str, object]:
-    runtime = PyriteRuntime()
+def _policy_benchmark(
+    prompt: str, blocks: int, config: RuntimeConfig | None = None
+) -> dict[str, object]:
+    runtime = PyriteRuntime(config)
     names = [f"layer:{index:04d}" for index in range(blocks)]
 
     rss_before = process_memory_mb()
@@ -127,12 +130,20 @@ def _checkpoint_benchmark(
     tokens: int,
     workers: int,
     prefetch: bool,
+    config: RuntimeConfig | None = None,
 ) -> dict[str, object]:
     """Measure real streaming generation on a local GGUF checkpoint."""
     from .executor import open_executor
 
     rss_before = process_memory_mb()
-    with open_executor(checkpoint, workers=workers, prefetch=prefetch, sampler_seed=0) as executor:
+    runtime = PyriteRuntime(config)
+    with open_executor(
+        checkpoint,
+        runtime=runtime,
+        workers=workers,
+        prefetch=prefetch,
+        sampler_seed=0,
+    ) as executor:
         report = executor.checkpoint_report()
         started = time.perf_counter()
         result = executor.generate_text(prompt, max_new_tokens=tokens, temperature=0.0)
@@ -166,18 +177,38 @@ def _checkpoint_benchmark(
         "streamed_bytes_per_second": (bytes_streamed / elapsed) if elapsed > 0 else 0.0,
         "streamed_bytes": bytes_streamed,
         "unsupported_tensor_types": report["unsupported_tensor_types"],
+        "execution_backend": "cpu-native" if stats["native_kernel_calls"] else "cpu-reference",
+        "native_kernel_available": report["native_kernel_available"],
+        "kv_cache_policy": report["kv_cache_policy"],
+        "working_set_budget_bytes": report["working_set_budget_bytes"],
+        "rss_limit_bytes": report["rss_limit_bytes"],
         "process_rss_before_mb": rss_before,
         "process_rss_after_mb": rss_after,
+        "process_rss_peak_mb": stats["rss_peak_mb"],
         "stats": stats,
     }
 
 
+def _nonnegative(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
+def _positive(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Pyrite runtime benchmark")
+    parser = argparse.ArgumentParser(description="Pyrite CPU runtime benchmark")
     parser.add_argument("--prompt", default="analyze this Python API bug")
     parser.add_argument(
         "--blocks",
-        type=int,
+        type=_nonnegative,
         default=16,
         help="number of synthetic blocks for the scheduler benchmark",
     )
@@ -185,25 +216,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint",
         help="benchmark real streaming generation on a GGUF checkpoint instead",
     )
-    parser.add_argument("--tokens", type=int, default=8, help="tokens to generate with --checkpoint")
-    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--tokens", type=_nonnegative, default=8, help="tokens to generate with --checkpoint")
+    parser.add_argument("--workers", type=_positive, default=2)
+    parser.add_argument("--profile", help="JSON runtime profile")
+    parser.add_argument("--ram-mb", type=_positive, help="resident RAM budget override")
+    parser.add_argument(
+        "--kv-cache-policy", choices=("stop", "sliding_window"),
+        help="KV capacity policy for checkpoint inference",
+    )
     parser.add_argument("--no-prefetch", action="store_true")
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    runtime_config: RuntimeConfig | None = None,
+) -> int:
     args = build_parser().parse_args(argv)
-
-    if args.checkpoint:
-        payload = _checkpoint_benchmark(
-            args.checkpoint,
-            args.prompt,
-            max(0, args.tokens),
-            max(1, args.workers),
-            not args.no_prefetch,
-        )
-    else:
-        payload = _policy_benchmark(args.prompt, max(0, args.blocks))
+    try:
+        config = runtime_config or RuntimeConfig.from_env()
+        if args.profile:
+            config = RuntimeConfig.from_profile(args.profile)
+        if args.ram_mb is not None:
+            config = config.with_overrides(ram_budget_mb=args.ram_mb)
+        if args.kv_cache_policy:
+            config = config.with_overrides(kv_cache_policy=args.kv_cache_policy)
+        config.validate()
+        if args.checkpoint:
+            payload = _checkpoint_benchmark(
+                args.checkpoint,
+                args.prompt,
+                args.tokens,
+                args.workers,
+                not args.no_prefetch,
+                config,
+            )
+        else:
+            payload = _policy_benchmark(args.prompt, args.blocks, config)
+    except (OSError, ValueError, KeyError, MemoryError, RuntimeError, TypeError) as exc:
+        print(f"bench: {exc}", file=sys.stderr)
+        return 2
 
     print(json.dumps(payload, indent=2))
     return 0
