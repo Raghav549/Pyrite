@@ -180,6 +180,55 @@ only `ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps` and never references an
 `shexp` tensor - Qwen3-MoE has **no shared expert**, unlike Qwen2-MoE. Pyrite
 matches that. Saved output: `validation/moe-crosscheck.txt`.
 
+### 128-expert, top-8 routing: where the two runtimes disagree
+
+Scaled the MoE fixture to the published expert count and top-k (128 experts,
+top-8, 4 layers, hidden 128, real 151,936-token vocabulary, 187,733,824 bytes)
+and ran 24 greedy tokens from three prompts:
+
+```
+  prompt='Explain Pyrite in one short '   tokens= 24 IDENTICAL=True
+  prompt='The capital of France is'       tokens= 24 IDENTICAL=False
+  prompt='def fibonacci(n):\n    '        tokens= 24 IDENTICAL=True
+
+2/3 runs byte-identical over 24 tokens each (128 experts, top-8)
+```
+
+The third run agreed for 21 tokens and then diverged. That divergence was
+investigated rather than dismissed. At the step where they split, the router
+probabilities around the top-8 boundary were:
+
+```
+uniform reference probability = 1/128 = 0.007812
+
+layer 0: p[8th]=0.008113419 p[9th]=0.008111419 gap=2.000e-06 relative=2.466e-04
+layer 1: p[8th]=0.008144742 p[9th]=0.008141605 gap=3.138e-06 relative=3.854e-04
+layer 2: p[8th]=0.008122600 p[9th]=0.008108373 gap=1.423e-05 relative=1.755e-03
+layer 3: p[8th]=0.008225250 p[9th]=0.008213662 gap=1.159e-05 relative=1.411e-03
+
+LM head at that step: top1 logit=0.133714510 top2 logit=0.131822833 gap=1.892e-03
+```
+
+The 8th and 9th experts are separated by **2.0e-06 to 1.4e-05** - two to four
+decimal places of a probability that is itself within 4% of the uniform 1/128.
+The router in this checkpoint carries essentially no signal, because its weights
+are random. Any difference in summation order between Pyrite's Python float
+arithmetic and llama.cpp's float32 SIMD matmul flips which expert is eighth, and
+swapping one expert worth ~0.8% of the mixture moves the hidden state enough to
+flip an LM-head argmax whose margin is 1.9e-03.
+
+So this is a near-tie resolved differently, not a routing disagreement. Pyrite's
+router matches llama.cpp's construction exactly: `softmax(gate_inp @ x)`, take
+the top-k, then renormalise over the selected k (`norm_topk_prob`), with ties
+broken by lower index. It is recorded here as a limitation because it is real:
+**on an MoE checkpoint whose router distribution is near-uniform, Pyrite and
+llama.cpp can select different experts and diverge.** A trained router is
+sharply peaked and this does not arise; the dense and 4-expert runs above did
+not hit it in 360 token decisions.
+
+Evidence: `validation/moe-128-expert-crosscheck.txt`,
+`validation/moe-128e-router-margin.txt`.
+
 ## Larger-model validation
 
 `models/qwen3-0p6b-shape.gguf` is a 1,411,777,152-byte checkpoint with the
@@ -255,6 +304,12 @@ is the script reproduced in `validation/benchmark-qwen3-0p6b-shape.txt`.
   unknown pre-tokenizer for the same reason.
 - **`_apply_merges` is O(n^2)** in the number of symbols in a piece. Long pieces
   in a large vocabulary are slower than they need to be.
+- **MoE expert selection can differ from llama.cpp on a near-uniform router.**
+  Measured above: with 128 random-weight experts the 8th and 9th router
+  probabilities differ by ~1e-05, so the top-k cut is a coin flip between
+  runtimes. Not a routing-logic disagreement, but it is a real difference and it
+  has only been ruled out for sharply-peaked (i.e. trained) routers by argument,
+  not by measurement.
 - **No GPU path.** Everything runs on CPU; there is no CUDA or Metal backend.
 - **No published MoE checkpoint was run.** The MoE cross-check above uses a
   locally built checkpoint with 4 experts, top-2 routing and random weights. The
@@ -274,3 +329,5 @@ is the script reproduced in `validation/benchmark-qwen3-0p6b-shape.txt`.
 | `validation/moe-crosscheck.txt` | The Qwen3-MoE generation cross-check against llama.cpp. |
 | `validation/greedy-divergence-check.txt` | 6/6 greedy runs, 48 tokens each, both architectures. |
 | `validation/bench-cli.json` | `pyrite bench` output, including the machine description. |
+| `validation/moe-128-expert-crosscheck.txt` | 128-expert top-8 cross-check: 2/3 identical. |
+| `validation/moe-128e-router-margin.txt` | The router margins that explain the divergence. |

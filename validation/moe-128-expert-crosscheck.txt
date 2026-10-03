@@ -1,0 +1,10 @@
+checkpoint : qwen3moe, 4 layers, hidden 128, 128 experts, top-8, moe_ffn 32, vocab 151936
+experts    : 128 top-k: 8 layers: 4
+  prompt='Explain Pyrite in one short '   tokens= 24 IDENTICAL=True
+  prompt='The capital of France is'       tokens= 24 IDENTICAL=False
+    llama.cpp: '.compressSharp锻炼💋ечениеële Tinderอร์鸳.compareTo SUP预定ViewModel prejudice⊃︹-positionمع vấn[PAD151808]'
+    pyrite   : '.compressSharp锻炼💋ечениеële Tinderอร์鸳.compareTo SUP预定ViewModel prejudice⊃︹-positionمع vấn greens设定 D'
+  prompt='def fibonacci(n):\n    '        tokens= 24 IDENTICAL=True
+expert_slices_streamed: 8736 native_calls: 118664
+
+2/3 runs byte-identical over 24 tokens each (128 experts, top-8)

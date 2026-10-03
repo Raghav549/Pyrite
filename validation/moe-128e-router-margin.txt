@@ -1,0 +1,10 @@
+Router probability margins at the step where Pyrite and llama.cpp diverged
+checkpoint: qwen3moe, 4 layers, hidden 128, 128 experts, top-8, RANDOM weights
+uniform reference probability = 1/128 = 0.007812
+
+layer 0: p[8th]=0.008113419 p[9th]=0.008111419 gap=2.000e-06 relative=2.466e-04
+layer 1: p[8th]=0.008144742 p[9th]=0.008141605 gap=3.138e-06 relative=3.854e-04
+layer 2: p[8th]=0.008122600 p[9th]=0.008108373 gap=1.423e-05 relative=1.755e-03
+layer 3: p[8th]=0.008225250 p[9th]=0.008213662 gap=1.159e-05 relative=1.411e-03
+
+LM head at that step: top1 logit=0.133714510 top2 logit=0.131822833 gap=1.892e-03
