@@ -107,10 +107,11 @@ python scripts/llama_crosscheck.py --llama-bin /path/to/llama.cpp/build/bin
 
 The measured results are in [`docs/validation.md`](docs/validation.md). On the
 same GGUF, with the same prompt and greedy decoding, Pyrite and llama.cpp
-produced 12 identical tokens. That checkpoint has random weights, so it validates
-the arithmetic, not model quality; no published Qwen3 checkpoint could be
-downloaded in the environment where this was measured, and none is claimed to
-have been run.
+produced 12 identical tokens - for both the dense and the Qwen3-MoE
+architectures. Those checkpoints have random weights, so they validate the
+arithmetic, not model quality; no published Qwen3 checkpoint could be downloaded
+in the environment where this was measured, and none is claimed to have been
+run.
 
 ## Privacy
 

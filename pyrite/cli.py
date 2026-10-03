@@ -198,16 +198,34 @@ def _plan_from_payload(model, config: RuntimeConfig):
 _DENSE_LABELS: dict[str, str] = {"qwen3": "Qwen3 dense", "llama": "LLaMA dense"}
 
 
-def _apply_expected_profile(config: object, expected: str | None) -> None:
-    """Fail with a precise diff when a declared profile does not match."""
+def _apply_expected_profile(
+    config: object, expected: str | None, architecture: str = ""
+) -> None:
+    """Fail with a precise diff when a declared profile does not match.
+
+    The architecture is checked against the GGUF's ``general.architecture``
+    key because that is where it lives; the parsed config does not carry it for
+    every architecture.
+    """
     if expected is None:
         return
-    result = check_profile(config, profile_for(expected))
-    if result["matches"]:
+    profile = profile_for(expected)
+    result = check_profile(config, profile)
+    mismatches = list(result["mismatches"])  # type: ignore[arg-type]
+    if architecture and architecture != profile.architecture:
+        mismatches.insert(
+            0,
+            {
+                "field": "general.architecture",
+                "expected": profile.architecture,
+                "actual": architecture,
+            },
+        )
+    if not mismatches:
         return
     details = "; ".join(
         f"{item['field']}: expected {item['expected']!r}, found {item['actual']!r}"
-        for item in result["mismatches"]  # type: ignore[index]
+        for item in mismatches
     )
     raise ValueError(f"checkpoint does not match profile {expected!r}: {details}")
 
@@ -380,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
             if architecture == MOE_ARCH:
                 model = Qwen3MoECheckpoint(args.checkpoint, reader=reader)
                 summary = model.validate_contract()
-                _apply_expected_profile(model.config, args.expect_profile)
+                _apply_expected_profile(model.config, args.expect_profile, architecture)
                 payload: dict[str, object] = {
                     "model": "Qwen3-MoE",
                     "architecture": architecture,
@@ -393,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
                     payload["memory"] = _memory_plan_payload(model, runtime.config)
             elif architecture in ("qwen3", "llama"):
                 model = DenseCheckpoint(args.checkpoint, reader=reader)
-                _apply_expected_profile(model.config, args.expect_profile)
+                _apply_expected_profile(model.config, args.expect_profile, architecture)
                 summary = model.validate_contract()
                 payload = {
                     "model": _DENSE_LABELS.get(architecture, f"{architecture} dense"),

@@ -1,0 +1,7 @@
+llama.cpp returncode: 0
+llama.cpp text: 'emand 있는데\r\n        \r\n Ant /**\n ,-_inp(Address surprisesthèseiveringkening'
+pyrite text   : 'emand 있는데\r\n        \r\n Ant /**\n ,-_inp(Address surprisesthèseiveringkening'
+pyrite ids    : [20096, 134563, 43005, 6755, 1554, 90504, 78887, 68492, 45440, 143387, 83940, 89273]
+prompt_tokens : 9
+lm_head       : output.weight [64, 151936] F32 tied= False
+IDENTICAL     : True

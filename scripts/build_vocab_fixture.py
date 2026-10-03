@@ -66,6 +66,9 @@ def build(
     head_dim: int,
     max_context: int,
     seed: int,
+    num_experts: int = 0,
+    num_experts_used: int = 0,
+    moe_ffn: int = 0,
 ) -> Path:
     tokens = list(vocab["tokens"])  # type: ignore[arg-type]
     vocab_size = len(tokens)
@@ -98,9 +101,24 @@ def build(
 
         builder.add_tensor_lazy(name, dims, 0, produce)
 
+    is_moe = architecture == "qwen3moe"
+    if is_moe and min(num_experts, num_experts_used, moe_ffn) <= 0:
+        raise ValueError(
+            "qwen3moe needs --experts, --experts-used and --moe-ffn to all be positive"
+        )
     builder.add(f"{architecture}.embedding_length", config.hidden_size)
     builder.add(f"{architecture}.block_count", config.num_hidden_layers)
-    builder.add(f"{architecture}.feed_forward_length", config.intermediate_size)
+    builder.add(
+        f"{architecture}.feed_forward_length",
+        moe_ffn * num_experts_used if is_moe else config.intermediate_size,
+    )
+    if is_moe:
+        builder.add(f"{architecture}.expert_feed_forward_length", moe_ffn)
+        builder.add(f"{architecture}.expert_count", num_experts)
+        builder.add(f"{architecture}.expert_used_count", num_experts_used)
+        # llama.cpp normalises the router weights for Qwen3-MoE.
+        builder.add(f"{architecture}.expert_weights_norm", True)
+        builder.add(f"{architecture}.expert_weights_scale", 1.0)
     builder.add(f"{architecture}.attention.head_count", config.num_attention_heads)
     builder.add(f"{architecture}.attention.head_count_kv", config.num_key_value_heads)
     builder.add(f"{architecture}.attention.key_length", config.head_dim)
@@ -110,8 +128,8 @@ def build(
     builder.add(f"{architecture}.context_length", config.max_position_embeddings)
     builder.add(f"{architecture}.vocab_size", vocab_size)
     builder.add(f"{architecture}.tied_word_embeddings", False)
-    if architecture == "qwen3":
-        builder.add("qwen3.attention.qk_norm", True)
+    if architecture in ("qwen3", "qwen3moe"):
+        builder.add(f"{architecture}.attention.qk_norm", True)
 
     builder.add("tokenizer.ggml.model", vocab["model"])
     builder.add("tokenizer.ggml.pre", vocab["pre"])
@@ -133,13 +151,37 @@ def build(
         add(f"{prefix}attn_k.weight", (config.hidden_size, kv_dim), 0.15)
         add(f"{prefix}attn_v.weight", (config.hidden_size, kv_dim), 0.15)
         add(f"{prefix}attn_output.weight", (q_dim, config.hidden_size), 0.15)
-        if architecture == "qwen3":
+        if architecture in ("qwen3", "qwen3moe"):
             add(f"{prefix}attn_q_norm.weight", (config.head_dim,), 0.05)
             add(f"{prefix}attn_k_norm.weight", (config.head_dim,), 0.05)
         add(f"{prefix}ffn_norm.weight", (config.hidden_size,), 0.05)
-        add(f"{prefix}ffn_gate.weight", (config.hidden_size, config.intermediate_size), 0.15)
-        add(f"{prefix}ffn_up.weight", (config.hidden_size, config.intermediate_size), 0.15)
-        add(f"{prefix}ffn_down.weight", (config.intermediate_size, config.hidden_size), 0.15)
+        if is_moe:
+            # llama.cpp's qwen3moe loads no shared-expert tensor: routed experts
+            # only, via a stacked 3D tensor per projection.
+            add(f"{prefix}ffn_gate_inp.weight", (config.hidden_size, num_experts), 0.15)
+            add(
+                f"{prefix}ffn_gate_exps.weight",
+                (config.hidden_size, moe_ffn, num_experts),
+                0.15,
+            )
+            add(
+                f"{prefix}ffn_up_exps.weight",
+                (config.hidden_size, moe_ffn, num_experts),
+                0.15,
+            )
+            add(
+                f"{prefix}ffn_down_exps.weight",
+                (moe_ffn, config.hidden_size, num_experts),
+                0.15,
+            )
+        else:
+            add(f"{prefix}ffn_gate.weight", (config.hidden_size, config.intermediate_size), 0.15)
+            add(f"{prefix}ffn_up.weight", (config.hidden_size, config.intermediate_size), 0.15)
+            add(
+                f"{prefix}ffn_down.weight",
+                (config.intermediate_size, config.hidden_size),
+                0.15,
+            )
 
     out.parent.mkdir(parents=True, exist_ok=True)
     builder.write_streaming(out)
@@ -159,6 +201,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--head-dim", type=int, default=16)
     parser.add_argument("--max-context", type=int, default=512)
     parser.add_argument("--seed", type=int, default=4321)
+    parser.add_argument("--experts", type=int, default=0, help="qwen3moe routed expert count")
+    parser.add_argument("--experts-used", type=int, default=0, help="qwen3moe top-k")
+    parser.add_argument("--moe-ffn", type=int, default=0, help="qwen3moe per-expert FFN width")
     args = parser.parse_args(argv)
 
     vocab = load_real_vocab(args.vocab_gguf)
@@ -174,6 +219,9 @@ def main(argv: list[str] | None = None) -> int:
         head_dim=args.head_dim,
         max_context=args.max_context,
         seed=args.seed,
+        num_experts=args.experts,
+        num_experts_used=args.experts_used,
+        moe_ffn=args.moe_ffn,
     )
     print(
         f"wrote {path} ({path.stat().st_size:,} bytes) arch={args.architecture} "

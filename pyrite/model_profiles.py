@@ -35,14 +35,17 @@ class ModelProfile:
     num_experts: int | None = None
     num_experts_per_tok: int | None = None
     moe_intermediate_size: int | None = None
-    num_shared_experts: int | None = None
 
     def expectations(self) -> dict[str, object]:
-        """Every non-``None`` field as a name -> expected value mapping."""
+        """Config attributes this profile pins.
+
+        ``architecture`` is deliberately absent: it lives in the GGUF's
+        ``general.architecture`` key, not on the parsed config, and
+        :func:`pyrite.cli._apply_expected_profile` checks it there.
+        """
         return {
             key: value
             for key, value in {
-                "architecture": self.architecture,
                 "num_hidden_layers": self.num_hidden_layers,
                 "hidden_size": self.hidden_size,
                 "num_attention_heads": self.num_attention_heads,
@@ -53,7 +56,6 @@ class ModelProfile:
                 "num_experts": self.num_experts,
                 "num_experts_per_tok": self.num_experts_per_tok,
                 "moe_intermediate_size": self.moe_intermediate_size,
-                "num_shared_experts": self.num_shared_experts,
             }.items()
             if value is not None
         }
@@ -62,6 +64,12 @@ class ModelProfile:
 # Dense Qwen3.  head_dim is 128 for every published dense Qwen3, which is *not*
 # hidden_size / num_attention_heads for the smaller sizes - the trap that makes
 # a silent default wrong.
+#
+# There is no shared-expert field on the MoE profiles.  Qwen3-MoE dropped the
+# shared expert that Qwen2-MoE had: llama.cpp master's
+# ``src/models/qwen3moe.cpp`` loads only ``ffn_gate_exps`` / ``ffn_up_exps`` /
+# ``ffn_down_exps`` and never references an ``shexp`` tensor, so asserting one
+# would be asserting a fact the reference implementation contradicts.
 PROFILES: tuple[ModelProfile, ...] = (
     ModelProfile(
         name="qwen3-0.6b",
@@ -142,7 +150,6 @@ PROFILES: tuple[ModelProfile, ...] = (
         num_experts=128,
         num_experts_per_tok=8,
         moe_intermediate_size=768,
-        num_shared_experts=1,
     ),
     ModelProfile(
         name="qwen3-235b-a22b",
@@ -157,7 +164,6 @@ PROFILES: tuple[ModelProfile, ...] = (
         num_experts=128,
         num_experts_per_tok=8,
         moe_intermediate_size=1536,
-        num_shared_experts=1,
     ),
 )
 

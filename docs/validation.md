@@ -59,10 +59,10 @@ cmake --build build -j2 --target llama-tokenize llama-completion
 
 ```
 $ python3 -m pytest -q
-326 passed in 33.22s
+335 passed in 31.83s
 ```
 
-The baseline before this round of work was **249 passed**; 77 tests were added.
+The baseline before this round of work was **249 passed**; 86 tests were added.
 No test is skipped on this machine.
 
 | New file | What it pins |
@@ -72,6 +72,7 @@ No test is skipped on this machine.
 | `tests/test_gguf_errors.py` | Corrupt magic, versions, counts, string lengths, tensor names, dimension counts, unknown types, out-of-range offsets, duplicates, alignment, truncated payloads. |
 | `tests/test_memory_plan.py` | KV estimate, `/proc/meminfo` units, footprint, plan acceptance/refusal, streaming note for larger-than-RAM models. |
 | `tests/test_tokenizer.py` | Per-`pre` pre-tokenizer semantics; refusal of multi-regex and missing `pre`. |
+| `tests/test_model_profiles.py` | The published-profile table cannot assert fields real checkpoints lack (architecture, shared experts). |
 
 ## Tokenizer vs llama.cpp
 
@@ -127,6 +128,34 @@ nothing about model quality.
 
 Saved outputs: `validation/llama-cpp-generation.txt`,
 `validation/pyrite-generation.txt`, `validation/generation-qwen3-vocab.json`.
+
+### Qwen3-MoE
+
+The same cross-check was run on the MoE architecture, using a checkpoint built
+with the same real Qwen2 vocabulary:
+
+```
+$ python3 scripts/build_vocab_fixture.py --vocab-gguf models/ggml-vocab-qwen2.gguf \
+      --out models/qwen3moe-vocab-fixture.gguf --architecture qwen3moe \
+      --hidden-size 64 --num-layers 2 --num-heads 4 --num-kv-heads 2 --head-dim 16 \
+      --experts 4 --experts-used 2 --moe-ffn 16
+wrote models/qwen3moe-vocab-fixture.gguf (83,921,760 bytes) arch=qwen3moe vocab=151936 pre='qwen2' layers=2 hidden=64
+```
+
+```
+llama.cpp : emand 있는데\r\n        \r\n Ant /**\n ,-_inp(Address surprisesthèseiveringkening
+pyrite    : emand 있는데\r\n        \r\n Ant /**\n ,-_inp(Address surprisesthèseiveringkening
+IDENTICAL : True
+```
+
+12/12 tokens identical. This exercises the softmax router, top-k expert
+selection, expert-weight normalisation, slicing of the stacked 3D
+`ffn_{gate,up,down}_exps` tensors, and the MoE SwiGLU path.
+
+One thing worth recording: llama.cpp master's `src/models/qwen3moe.cpp` loads
+only `ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps` and never references an
+`shexp` tensor - Qwen3-MoE has **no shared expert**, unlike Qwen2-MoE. Pyrite
+matches that. Saved output: `validation/moe-crosscheck.txt`.
 
 ## Larger-model validation
 
@@ -192,9 +221,10 @@ is read from disk or cache once per token and there are only 2 cores.
 - **`_apply_merges` is O(n^2)** in the number of symbols in a piece. Long pieces
   in a large vocabulary are slower than they need to be.
 - **No GPU path.** Everything runs on CPU; there is no CUDA or Metal backend.
-- **Qwen3-MoE is implemented but was only exercised on tiny fixtures**
-  (`tests/tiny_qwen3moe.py`). No real MoE checkpoint was available here, so its
-  agreement with llama.cpp is unverified.
+- **No published MoE checkpoint was run.** The MoE cross-check above uses a
+  locally built checkpoint with 4 experts, top-2 routing and random weights. The
+  routing path is verified against llama.cpp, but nothing at 128-expert scale
+  was executed here.
 
 ## Artifacts
 
@@ -206,3 +236,4 @@ is read from disk or cache once per token and there are only 2 cores.
 | `validation/benchmark-qwen3-0p6b-shape.txt` | The benchmark above. |
 | `validation/qwen3-vocab-check.json` | Full `qwen3-check --full` on the 84 MB fixture. |
 | `validation/qwen3-0p6b-shape-check.json` | Full `qwen3-check --full` on the 1.41 GB fixture. |
+| `validation/moe-crosscheck.txt` | The Qwen3-MoE generation cross-check against llama.cpp. |
