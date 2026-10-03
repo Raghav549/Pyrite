@@ -32,7 +32,7 @@ python3 -m pyrite tokenize models/qwen3-vocab-fixture.gguf "Hello world"
 # Supported quantization types and decoder support
 python3 -m pyrite types --decodable-only
 
-# Benchmark
+# Route-planning benchmark (planning only, not inference - see below)
 python3 -m pyrite bench
 
 # Build the reference fixtures used below
@@ -152,6 +152,29 @@ IDENTICAL : True
 selection, expert-weight normalisation, slicing of the stacked 3D
 `ffn_{gate,up,down}_exps` tensors, and the MoE SwiGLU path.
 
+### 288-step greedy divergence check
+
+Twelve tokens from one prompt only tests argmax at twelve hidden states. So both
+fixtures were run for 48 tokens from three different prompts each - prose, a
+partial sentence, and Python source - and compared byte for byte:
+
+```
+qwen3 dense  prompt='Explain Pyrite in one short '   tokens= 48 IDENTICAL=True agreeing_prefix=249/249
+qwen3 dense  prompt='The capital of France is'       tokens= 48 IDENTICAL=True agreeing_prefix=226/226
+qwen3 dense  prompt='def fibonacci(n):\n    '        tokens= 48 IDENTICAL=True agreeing_prefix=237/237
+qwen3moe     prompt='Explain Pyrite in one short '   tokens= 48 IDENTICAL=True agreeing_prefix=236/236
+qwen3moe     prompt='The capital of France is'       tokens= 48 IDENTICAL=True agreeing_prefix=258/258
+qwen3moe     prompt='def fibonacci(n):\n    '        tokens= 48 IDENTICAL=True agreeing_prefix=243/243
+
+6/6 greedy runs byte-identical over 48 tokens each
+```
+
+288 consecutive argmax decisions agreed, from three unrelated starting states.
+A forward pass that differed by more than float noise would diverge within a few
+steps, because each step's output feeds the next. This is evidence about the
+logits, not just the sampled ids, though it is not a direct float comparison.
+Saved output: `validation/greedy-divergence-check.txt`.
+
 One thing worth recording: llama.cpp master's `src/models/qwen3moe.cpp` loads
 only `ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps` and never references an
 `shexp` tensor - Qwen3-MoE has **no shared expert**, unlike Qwen2-MoE. Pyrite
@@ -207,6 +230,18 @@ The native C kernels account for 47.8 s of the run; Python orchestration is the
 remainder. Decode throughput is dominated by the fact that every weight tensor
 is read from disk or cache once per token and there are only 2 cores.
 
+Machine, as reported by `python3 -m pyrite bench`
+(`validation/bench-cli.json`):
+
+```
+Intel(R) Xeon(R) Processor @ 2.60GHz | 2 cores | 3939.9 MiB RAM | Python 3.11.2
+Linux-6.1.158+-x86_64-with-glibc2.36
+```
+
+Note that `pyrite bench` benchmarks *route planning* (16 plans in 0.66 ms), not
+inference. The inference numbers above come from the direct measurement, which
+is the script reproduced in `validation/benchmark-qwen3-0p6b-shape.txt`.
+
 ## Known limitations
 
 - **IQ4_XS is decoded in Python only.** The other 19 native types have C
@@ -237,3 +272,5 @@ is read from disk or cache once per token and there are only 2 cores.
 | `validation/qwen3-vocab-check.json` | Full `qwen3-check --full` on the 84 MB fixture. |
 | `validation/qwen3-0p6b-shape-check.json` | Full `qwen3-check --full` on the 1.41 GB fixture. |
 | `validation/moe-crosscheck.txt` | The Qwen3-MoE generation cross-check against llama.cpp. |
+| `validation/greedy-divergence-check.txt` | 6/6 greedy runs, 48 tokens each, both architectures. |
+| `validation/bench-cli.json` | `pyrite bench` output, including the machine description. |
