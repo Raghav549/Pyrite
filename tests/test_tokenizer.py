@@ -6,9 +6,11 @@ import pytest
 from pyrite.tokenizer import (
     GGUFBPETokenizer,
     TokenizerSpec,
+    UnsupportedPreTokenizer,
     WhitespaceTokenizer,
     bytes_to_unicode,
     load_gguf_tokenizer,
+    pre_tokenizer_for,
 )
 
 from .tiny_qwen3moe import make_test_tokenizer, tokenizer_vocab
@@ -81,6 +83,7 @@ def test_empty_vocabulary_is_rejected():
 def test_load_gguf_tokenizer_reads_metadata():
     reader_metadata = {
         "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.pre": "qwen2",
         "tokenizer.ggml.tokens": ["a", "b", "ab"],
         "tokenizer.ggml.merges": ["a b"],
         "tokenizer.ggml.bos_token_id": 2,
@@ -95,6 +98,43 @@ def test_load_gguf_tokenizer_reads_metadata():
     assert tokenizer is not None
     assert tokenizer.bos_id == 2 and tokenizer.eos_id == 1
     assert [tokenizer.tokens[i] for i in tokenizer.encode("ab")] == ["ab"]
+
+
+def test_missing_pre_tokenizer_is_refused():
+    """A BPE file with no ``tokenizer.ggml.pre`` must not be guessed at.
+
+    llama.cpp reads the key without a fallback and throws for an unknown
+    pre-tokenizer; Pyrite refuses for the same reason instead of emitting
+    plausible-looking but wrong token ids.
+    """
+
+    class _Reader:
+        def metadata(self):
+            return {
+                "tokenizer.ggml.model": "gpt2",
+                "tokenizer.ggml.tokens": ["a", "b"],
+                "tokenizer.ggml.merges": [],
+            }
+
+    with pytest.raises(UnsupportedPreTokenizer):
+        load_gguf_tokenizer(_Reader())
+
+
+def test_multi_regex_pre_tokenizer_is_refused():
+    with pytest.raises(UnsupportedPreTokenizer):
+        pre_tokenizer_for("default")
+    with pytest.raises(UnsupportedPreTokenizer):
+        pre_tokenizer_for("chameleon")
+
+
+def test_pre_tokenizer_patterns_match_the_reference_semantics():
+    # qwen2: one digit at a time, letters run together, newline preserved.
+    assert pre_tokenizer_for("qwen2").findall("ab 12\n") == ["ab", " ", "1", "2", "\n"]
+    # llama-bpe/llama3: digits are grouped in runs of at most three.
+    assert pre_tokenizer_for("llama-bpe").findall("1234") == ["123", "4"]
+    # gpt-2: digits are one run, and there is no bare-whitespace alternative,
+    # so an unmatched newline is dropped exactly as llama.cpp's regex does.
+    assert pre_tokenizer_for("gpt-2").findall("a1234\nb") == ["a", "1234", "b"]
 
 
 def test_load_gguf_tokenizer_returns_none_for_other_models():

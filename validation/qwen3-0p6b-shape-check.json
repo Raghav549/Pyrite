@@ -1,0 +1,88 @@
+{
+  "model": "Qwen3 dense",
+  "architecture": "qwen3",
+  "config": {
+    "architecture": "qwen3",
+    "hidden_size": 1024,
+    "intermediate_size": 3072,
+    "num_hidden_layers": 28,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "head_dim": 64,
+    "value_dim": 64,
+    "rotary_dim": 64,
+    "vocab_size": 271,
+    "rms_norm_eps": 9.999999747378752e-06,
+    "rope_theta": 500000.0,
+    "max_position_embeddings": 512,
+    "bos_token_id": 269,
+    "eos_token_id": 270,
+    "tie_word_embeddings": false,
+    "has_qk_norm": true,
+    "vocab_token_count": 271,
+    "vocab_source": "token_embd.weight rows",
+    "tie_declared": false
+  },
+  "validation": {
+    "architecture": "qwen3",
+    "layers": 28,
+    "vocab_size": 271,
+    "vocab_token_count": 271,
+    "vocab_source": "token_embd.weight rows",
+    "lm_head": {
+      "tensor": "output.weight",
+      "tied": false,
+      "declared_tied": false,
+      "shape": [
+        1024,
+        271
+      ],
+      "type": "F32",
+      "source": "output.weight is present, so it is the LM head"
+    },
+    "unsupported_tensor_types": [],
+    "tensor_types_decodable": true,
+    "native_generation_ready": true
+  },
+  "streaming": {
+    "resident_bytes": 3327754240,
+    "tensor_count": 311,
+    "total_bytes": 1411753984,
+    "oversized_tensors": 0,
+    "largest_tensor_bytes": 12582912,
+    "largest_row_bytes": 12288,
+    "can_stream_storage": true,
+    "whole_model_residency_required": false,
+    "full_model_loaded": false
+  },
+  "memory": {
+    "model": {
+      "path": "/home/user/models/qwen3-0p6b-shape.gguf",
+      "tensor_count": 311,
+      "tensor_bytes": 1411753984,
+      "file_bytes": 1411777152,
+      "largest_tensor_bytes": 12582912,
+      "largest_row_bytes": 12288,
+      "largest_streamed_unit_bytes": 12288
+    },
+    "model_mb": 1346.4,
+    "kv_cache_mb": 58.4,
+    "workspace_mb": 3269.6,
+    "resident_requirement_mb": 3328.0,
+    "budget_mb": 3328.0,
+    "ram_total_mb": 3939.9,
+    "ram_available_mb": 3610.2,
+    "availability_source": "/proc/meminfo",
+    "fits_budget": true,
+    "fits_available_ram": true,
+    "largest_streamed_unit_fits": true,
+    "model_larger_than_ram": false,
+    "streams_from_disk": true,
+    "problems": [],
+    "notes": [],
+    "ok": true,
+    "configured_max_kv_tokens": 512,
+    "kv_cache_dim": 1024,
+    "requested_context_tokens": 512
+  }
+}

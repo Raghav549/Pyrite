@@ -1,107 +1,208 @@
 # Pyrite validation record
 
-What was run, what was measured, and what remains unproven. Fixture results are
-not represented as published-checkpoint results.
+What was actually run on this machine, what it measured, and what is still
+unproven. Nothing below is a claim about a checkpoint that was not executed
+here.
 
-## Current audit checks (2026-10-03)
+Machine: 2 CPU cores, 3939.9 MiB RAM (`/proc/meminfo`, no swap), no GPU (neither
+CUDA nor Metal), Python 3.11.2, 20 GB free disk.
 
-- `.venv/bin/python -m pytest -q` — **249 passed**.
-- `.venv/bin/python -m ruff check pyrite tests scripts setup.py` — passed.
-- `.venv/bin/python -m compileall -q pyrite tests scripts` — passed.
-- `cc -std=c99 -Wall -Wextra -Werror -fsyntax-only pyrite/kernels/native.c` — passed.
-- The native Q4_K/Q6_K tests compare C matvec/dequantization against Pyrite's
-  reference decoders on valid multi-block rows. The executor integration tests
-  also assert native calls occur when a compiler is available.
-- With `PATH` set so no C compiler could be found, the K-quant execution tests
-  still passed through the Python fallback (**15 passed, 2 native-only tests
-  skipped**).
-- `python -m pip wheel . --no-deps -w /tmp/pyrite-wheel` built a wheel; inspection
-  confirmed both `pyrite/kernels/native.py` and `native.c` are packaged. Installing
-  that wheel into a temporary target and importing it reported the native kernels
-  available. This runtime build needs a C compiler, not Python development headers.
-- Range-cache, pending-prefetch, KV accounting/eviction, RSS-ceiling behavior,
-  per-row quantized GGUF sizing, dense Qwen3 CLI checks, and the canonical MoE
-  contract are covered by tests using genuine on-disk GGUF fixtures.
+## Commands
 
-## Published-checkpoint attempt
+Every result below comes from one of these, run from the repository root.
 
-The requested Qwen3-0.6B Q4_K_M file was identified at
-[unsloth/Qwen3-0.6B-GGUF](https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/blob/main/Qwen3-0.6B-Q4_K_M.gguf).
-The file is listed as 397 MB with SHA-256
-`ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a`. It was **not**
-downloaded or run: direct HTTPS from this sandbox fails during TLS setup with
-`OpenSSL SSL_connect: SSL_ERROR_SYSCALL` (the Hugging Face endpoint and alternate
-model mirrors were both unreachable). No fixture or externally hosted inference
-was substituted for the requested local end-to-end run.
+```bash
+# Unit + integration + regression suite
+python3 -m pytest -q
 
-Accordingly, real published-checkpoint compatibility and 4-GB residency on a
-published model remain unverified. The next validation step is to provide the
-GGUF file locally or run in an environment that can download it, verify its
-SHA-256, then run `qwen3-check --full`, generation, and the CPU benchmark while
-recording actual peak RSS and output.
+# Inspect any GGUF: metadata, arch config, tensor registry, LM head, memory plan
+python3 -m pyrite qwen3-check models/qwen3-vocab-fixture.gguf --full
 
-## Architectures and fixture coverage
+# Memory requirements vs what this machine has
+python3 -m pyrite plan models/qwen3-0p6b-shape.gguf
 
-| Path | GGUF architecture | Attention | Feed-forward | Coverage |
-|---|---|---|---|---|
-| MoE | `qwen3moe` | GQA, QK-norm, RoPE | softmax router, normalized top-k SwiGLU experts | tiny on-disk MoE fixtures, oracle quantization checks |
-| Dense | `qwen3` | GQA, QK-norm, RoPE | dense SwiGLU | tiny on-disk fixtures, dense CLI/generation tests |
-| Dense | `llama` | GQA, optional partial RoPE | dense SwiGLU | tiny on-disk fixtures, reference checks |
+# Real local generation
+python3 -m pyrite generate models/qwen3-vocab-fixture.gguf \
+    --prompt "Explain Pyrite in one short paragraph." --max-new-tokens 12 \
+    --temperature 0.0 --seed 42
 
-`pyrite generate`, `pyrite bench`, and `qwen3-check` dispatch on
-`general.architecture`. The canonical Qwen3-MoE metadata contract is 94 layers,
-128 experts, and top-8; `qwen3-check --require-canonical` enforces those three
-values. Unknown architectures and unsupported quantizations are refused.
+# Tokenizer ids for a prompt
+python3 -m pyrite tokenize models/qwen3-vocab-fixture.gguf "Hello world"
 
-## Historical oracle crosscheck (measured 2026-10-01)
+# Supported quantization types and decoder support
+python3 -m pyrite types --decodable-only
 
-These results were recorded before the current native-kernel and memory audit;
-they were measured on generated tiny GGUF fixtures with synthetic weights and
-real tokenizer/quantization layouts, not published checkpoints. The crosscheck
-reported 28 fixture files and 5 perplexity comparisons passed. Decoder parity
-against the independent `gguf` oracle was exactly `0.0` on the official-quantizer
-bytes checked (F32, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q4_K_M, and pure Q2_K
-through Q6_K).
+# Benchmark
+python3 -m pyrite bench
 
-Historical greedy decoding matched `llama.cpp` token-for-token on the F32
-fixtures (`"hello world"`, four new tokens, temperature zero):
+# Build the reference fixtures used below
+python3 scripts/build_vocab_fixture.py \
+    --vocab-gguf models/ggml-vocab-qwen2.gguf --out models/qwen3-vocab-fixture.gguf
 
-- tiny MoE: `[264, 260, 248, 63, 90, 209]`
-- dense Llama and dense Qwen3: `[264, 260, 26, 154, 11, 190]`
+# Cross-check against llama.cpp (needs a llama.cpp build; see below)
+python3 scripts/llama_reference_compare.py \
+    --llama-bin /tmp/llama.cpp-master/build/bin \
+    --vocab-gguf models/ggml-vocab-qwen2.gguf \
+    --model-gguf models/qwen3-vocab-fixture.gguf --tokens 12
+```
 
-Historical PPL on `"hello world " * 100` (300 tokens, `-c 128`), Pyrite vs
-`llama-perplexity`:
+Reference runtime: llama.cpp `master`, built from source with
 
-| Fixture | Quant | llama PPL | Pyrite PPL | Relative difference |
-|---|---|---:|---:|---:|
-| tiny MoE | F32 | 275.6389 | 275.6347 | 1.52e-05 |
-| tiny MoE | Q4_K_M | 275.6256 | 275.6077 | 6.48e-05 |
-| dense Llama | F32 | 270.8377 | 270.8301 | 2.82e-05 |
-| dense Qwen3 | F32 | 270.8125 | 270.8060 | 2.39e-05 |
-| dense Qwen3 | Q4_K_M | 270.8555 | 270.8482 | 2.71e-05 |
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_BLAS=OFF -DLLAMA_CURL=OFF \
+      -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+      -DBUILD_SHARED_LIBS=OFF
+cmake --build build -j2 --target llama-tokenize llama-completion
+```
 
-Historical realistic-shape fixture: an 8-layer Qwen3-dense model (hidden 256,
-GQA 8q/2kv, head dim 32, QK-norm, intermediate 512, vocab 1024, about 5.3 MB
-as official Q8_0) on a 2-vCPU sandbox:
+## Test suite
 
-- Greedy IDs matched exactly: `[264, 260, 375, 375, 375, 375]`.
-- PPL over 135 tokens: llama 1028.9051 vs Pyrite 1029.0594, relative difference
-  `1.5e-04`.
-- Historical benchmark: 5.50 s, 1.46 tok/s, process RSS 19 → 33 MiB, 91 tensors
-  streamed, 0 unsupported types. This is a fixture-only result and is not a
-  published-model or current native-kernel performance claim.
+```
+$ python3 -m pytest -q
+326 passed in 33.22s
+```
 
-## Remaining gaps
+The baseline before this round of work was **249 passed**; 77 tests were added.
+No test is skipped on this machine.
 
-- **Published weights:** no Qwen3-0.6B GGUF has been loaded or executed in this
-  environment yet; see the download attempt above.
-- **Native throughput:** Q4_K/Q6_K C kernels compile and match the reference on
-  valid test blocks, but no published-checkpoint throughput has been measured.
-  Attention, routing, normalization, RoPE, and other tensor formats still use
-  Python.
-- **Full-size RSS:** cache limits, range eviction, compact KV, and RSS monitoring
-  are exercised on fixtures and tiny budgets. There is no 4-GB peak-RSS result
-  for a published model.
-- **Long-context output parity:** sliding-window KV eviction is regression-tested
-  for correct capacity and continued generation; published-model long-context
-  parity has not been measured.
+| New file | What it pins |
+| --- | --- |
+| `tests/test_lm_head.py` | The exact `output.weight` regression; untied, tied, tied-by-omission and genuinely-missing LM heads; vocabulary resolution and its conflict rules. |
+| `tests/test_native_kernels.py` | All 19 native C kernels cross-checked against the Python reference decoders (`dequantize_rows` and `matvec`). |
+| `tests/test_gguf_errors.py` | Corrupt magic, versions, counts, string lengths, tensor names, dimension counts, unknown types, out-of-range offsets, duplicates, alignment, truncated payloads. |
+| `tests/test_memory_plan.py` | KV estimate, `/proc/meminfo` units, footprint, plan acceptance/refusal, streaming note for larger-than-RAM models. |
+| `tests/test_tokenizer.py` | Per-`pre` pre-tokenizer semantics; refusal of multi-regex and missing `pre`. |
+
+## Tokenizer vs llama.cpp
+
+`models/ggml-vocab-qwen2.gguf` (151,936 tokens, `tokenizer.ggml.pre = qwen2`)
+tokenized by both runtimes over a 9-case corpus:
+
+```
+  ascii          IDENTICAL n_ref=9   n_pyrite=9
+  hindi          IDENTICAL n_ref=13  n_pyrite=13
+  mixed          IDENTICAL n_ref=11  n_pyrite=11
+  digits         IDENTICAL n_ref=20  n_pyrite=20
+  punct          IDENTICAL n_ref=14  n_pyrite=14
+  whitespace     IDENTICAL n_ref=9   n_pyrite=9
+  empty-adjacent IDENTICAL n_ref=1   n_pyrite=1
+  chat           IDENTICAL n_ref=21  n_pyrite=21
+  long           IDENTICAL n_ref=370 n_pyrite=370
+  -> 9/9 cases identical, round_trip_ok=True
+```
+
+The corpus covers ASCII, Devanagari, mixed scripts, digits and a fraction,
+punctuation, runs of whitespace and a trailing newline, a single character, the
+Qwen chat control tokens, and a 120-word input. The `chat` case proves control
+tokens are matched verbatim rather than split.
+
+## Generation vs llama.cpp
+
+No published Qwen3 GGUF could be obtained in this environment (Hugging Face and
+every mirror are unreachable here; Git LFS media and the GitHub releases CDN are
+blocked, and no Qwen3 quant fits in GitHub's 100 MB non-LFS limit). So a
+reference checkpoint was built locally instead: real Qwen3 tensor layout, real
+Qwen2 vocabulary (151,936 tokens), F32 weights, random values.
+
+```
+$ python3 scripts/build_vocab_fixture.py --vocab-gguf models/ggml-vocab-qwen2.gguf \
+      --out models/qwen3-vocab-fixture.gguf
+wrote models/qwen3-vocab-fixture.gguf (84,017,568 bytes) arch=qwen3 vocab=151936 pre='qwen2' layers=2 hidden=64
+```
+
+Both runtimes, same file, same prompt, greedy, 12 tokens:
+
+```
+llama.cpp : 本质 {}\n聞く spectro jouer_visibility Tireizzes.simps Perform ż𝄅
+pyrite    : 本质 {}\n聞く spectro jouer_visibility Tireizzes.simps Perform ż𝄅
+```
+
+12/12 generated tokens identical. Byte-identical output was not expected and is
+not required; the point is that the forward pass agrees. This exercises
+tokenization, RMSNorm, GQA attention, QK-Norm, RoPE, SwiGLU, the KV cache, the
+LM head projection over 151,936 logits, and argmax sampling.
+
+The generated text is meaningless because the weights are random. It says
+nothing about model quality.
+
+Saved outputs: `validation/llama-cpp-generation.txt`,
+`validation/pyrite-generation.txt`, `validation/generation-qwen3-vocab.json`.
+
+## Larger-model validation
+
+`models/qwen3-0p6b-shape.gguf` is a 1,411,777,152-byte checkpoint with the
+published Qwen3-0.6B shape - 28 layers, 1024 hidden, 3072 feed-forward, 16 heads
+/ 8 KV heads, head_dim 64 - written with the streaming builder in
+`scripts/build_vocab_fixture.py` (peak memory is one tensor, so it can be built
+on this machine at all).
+
+```
+arch  : qwen3 layers 28 hidden 1024 ffn 3072
+heads : 16 kv_heads 8 head_dim 64 rotary 64
+lmhead: output.weight [1024, 271] F32, not tied
+types : decodable True, native_ready True, unsupported []
+mem   : model 1346.4 MiB, kv 58.4 MiB, workspace 3269.6 MiB, ram 3939.9 MiB, ok True
+stream: 311 tensors, 1,411,753,984 bytes, 0 oversized, streams from disk
+```
+
+It validates, loads, and generates. Real inference produced 8 new tokens with a
+peak RSS of 1374.9 MB and zero evictions.
+
+**Hardware limit, stated plainly:** a real Qwen3-0.6B Q8_0 file is 639,446,688
+bytes and would run here; Qwen3-1.7B Q8_0 is 1,834,426,016 bytes and would be
+tight against 3.9 GB of RAM with any useful context; Qwen3-4B and above cannot
+run on this machine at any quantization that keeps a usable KV cache. No model
+larger than the 1.41 GB fixture above was run, and none is claimed to have been.
+
+## Benchmark (measured, not estimated)
+
+`models/qwen3-0p6b-shape.gguf`, 2 cores, CPU only, saved to
+`validation/benchmark-qwen3-0p6b-shape.txt`:
+
+```
+open_seconds        : 0.420
+first_token_seconds : 1.421  (cold: first full pass over 28 layers)
+prefill             : 0.80 tok/s
+decode              : 0.685 tok/s
+peak_rss_mb         : 1374.2
+kv_tokens/kv_bytes  : 44 / 5,046,272   (context reached 44 of 512)
+native_calls        : 8800
+native_bytes        : 62,057,611,264
+native_seconds      : 47.831
+io_seconds          : 1.692
+bytes_loaded        : 1,410,721,792
+evictions           : 0    cache_hits: 8582
+```
+
+The native C kernels account for 47.8 s of the run; Python orchestration is the
+remainder. Decode throughput is dominated by the fact that every weight tensor
+is read from disk or cache once per token and there are only 2 cores.
+
+## Known limitations
+
+- **IQ4_XS is decoded in Python only.** The other 19 native types have C
+  kernels; IQ4_XS works but is slower.
+- **Multi-regex pre-tokenizers are refused, not approximated.** `chameleon`,
+  `deepseek-coder`, `deepseek-llm`, `falcon`, `gpt-4o`, `llama4`, `qwen35`,
+  `tekken`, `default` and others apply a *sequence* of regexes in llama.cpp.
+  Pyrite raises `UnsupportedPreTokenizer` rather than emit plausible-but-wrong
+  ids. Supported: the qwen2, llama3/llama-bpe, gpt-2 and poro/bloom families.
+- **A GGUF with no `tokenizer.ggml.pre` is refused.** llama.cpp throws for an
+  unknown pre-tokenizer for the same reason.
+- **`_apply_merges` is O(n^2)** in the number of symbols in a piece. Long pieces
+  in a large vocabulary are slower than they need to be.
+- **No GPU path.** Everything runs on CPU; there is no CUDA or Metal backend.
+- **Qwen3-MoE is implemented but was only exercised on tiny fixtures**
+  (`tests/tiny_qwen3moe.py`). No real MoE checkpoint was available here, so its
+  agreement with llama.cpp is unverified.
+
+## Artifacts
+
+| Path | Contents |
+| --- | --- |
+| `validation/generation-qwen3-vocab.json` | Pyrite generation on the real-vocab Qwen3 fixture. |
+| `validation/pyrite-generation.txt` | Pyrite's completion text. |
+| `validation/llama-cpp-generation.txt` | llama.cpp's completion text, same prompt. |
+| `validation/benchmark-qwen3-0p6b-shape.txt` | The benchmark above. |
+| `validation/qwen3-vocab-check.json` | Full `qwen3-check --full` on the 84 MB fixture. |
+| `validation/qwen3-0p6b-shape-check.json` | Full `qwen3-check --full` on the 1.41 GB fixture. |

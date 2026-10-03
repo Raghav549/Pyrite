@@ -13,18 +13,213 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-# Qwen2/Qwen3 style pre-tokenization, written with Python's ``re`` (which is
-# Unicode-aware for ``\\w``/``\\d``) instead of requiring the third-party
-# ``regex`` module.  ``\\p{L}`` becomes ``[^\\W\\d_]`` and ``\\p{N}`` becomes ``\\d``.
-PRE_TOKEN_PATTERN = re.compile(
-    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
-    r"|(?:[^\w\r\n]|_)?[^\W\d_]+"
-    r"|\d"
-    r"| ?[^\s\w]+[\r\n]*"
+#: ``tokenizer.ggml.token_type`` values, from ``gguf.constants.TokenType``.
+TOKEN_TYPE_NORMAL = 1
+TOKEN_TYPE_UNKNOWN = 2
+TOKEN_TYPE_CONTROL = 3
+TOKEN_TYPE_USER_DEFINED = 4
+TOKEN_TYPE_UNUSED = 5
+TOKEN_TYPE_BYTE = 6
+
+#: llama.cpp treats control, user-defined and unknown tokens as "special": they
+#: are matched verbatim in the prompt and are not produced by the BPE pass
+#: (``llama-vocab.cpp``: ``attr & (CONTROL | USER_DEFINED | UNKNOWN)``).
+SPECIAL_TOKEN_TYPES = frozenset(
+    {TOKEN_TYPE_CONTROL, TOKEN_TYPE_USER_DEFINED, TOKEN_TYPE_UNKNOWN}
+)
+
+
+class UnsupportedPreTokenizer(ValueError):
+    """Raised for a ``tokenizer.ggml.pre`` Pyrite does not implement exactly."""
+
+
+# ---------------------------------------------------------------------------
+# Pre-tokenizer patterns
+#
+# ``tokenizer.ggml.pre`` selects the regex llama.cpp uses to split text before
+# BPE (``LLAMA_VOCAB_PRE_TYPE_*`` in ``src/llama-vocab.cpp``).  Using the wrong
+# one produces silently wrong token ids, so Pyrite implements only the
+# single-pattern pre-tokenizers it can reproduce exactly and refuses the rest
+# instead of guessing.  The patterns below are transcribed from that file;
+# ``\\p{...}`` classes are expanded from ``unicodedata`` at first use.
+#
+# The ``(?:'[sS]|...)`` spelling is deliberate: ``(?i:...)`` scoped inline flags
+# only exist from Python 3.11 and Pyrite supports 3.10.
+# ---------------------------------------------------------------------------
+_QWEN2_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
     r"|\s*[\r\n]+"
     r"|\s+(?!\S)"
     r"|\s+"
 )
+_LLAMA_BPE_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+_GPT2_PATTERN = (
+    r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)"
+)
+_PORO_PATTERN = r" ?[^\(\s|.,!?…。，、।۔،)]+"  # noqa: RUF001 - these code points are in the reference regex
+
+#: ``tokenizer.ggml.pre`` value -> single-regex pre-tokenizer.
+PRE_TOKENIZER_PATTERNS: dict[str, str] = {
+    # llama.cpp: LLAMA_VOCAB_PRE_TYPE_QWEN2 / STABLELM2 / HUNYUAN / SOLAR_OPEN
+    "qwen2": _QWEN2_PATTERN,
+    "deepseek-r1-qwen": _QWEN2_PATTERN,
+    "kormo": _QWEN2_PATTERN,
+    "f2llmv2": _QWEN2_PATTERN,
+    "hunyuan": _QWEN2_PATTERN,
+    "solar-open": _QWEN2_PATTERN,
+    "stablelm2": _QWEN2_PATTERN,
+    # LLAMA_VOCAB_PRE_TYPE_LLAMA3 / LLAMA_BPE / DBRX / SMAUG
+    "llama3": _LLAMA_BPE_PATTERN,
+    "llama-v3": _LLAMA_BPE_PATTERN,
+    "llama-bpe": _LLAMA_BPE_PATTERN,
+    "dbrx": _LLAMA_BPE_PATTERN,
+    "smaug-bpe": _LLAMA_BPE_PATTERN,
+    # LLAMA_VOCAB_PRE_TYPE_GPT2 / MPT / OLMO / JAIS / TRILLION
+    "gpt-2": _GPT2_PATTERN,
+    "mpt": _GPT2_PATTERN,
+    "olmo": _GPT2_PATTERN,
+    "jais": _GPT2_PATTERN,
+    "trillion": _GPT2_PATTERN,
+    # LLAMA_VOCAB_PRE_TYPE_STARCODER / REFACT / COMMAND_R / SMOLLM / EXAONE
+    "starcoder": _GPT2_PATTERN,
+    "refact": _GPT2_PATTERN,
+    "command-r": _GPT2_PATTERN,
+    "smollm": _GPT2_PATTERN,
+    "codeshell": _GPT2_PATTERN,
+    "exaone": _GPT2_PATTERN,
+    # LLAMA_VOCAB_PRE_TYPE_PORO / BLOOM / GPT3_FINNISH
+    "poro-chat": _PORO_PATTERN,
+    "bloom": _PORO_PATTERN,
+    "gpt3-finnish": _PORO_PATTERN,
+}
+
+#: ``tokenizer.ggml.pre`` values whose llama.cpp pre-tokenizer is a *list* of
+#: regexes applied in sequence.  A joined alternation is not equivalent, so
+#: Pyrite refuses them rather than emitting plausible-looking wrong ids.
+MULTI_PATTERN_PRE_TOKENIZERS: frozenset[str] = frozenset(
+    {
+        "chameleon", "deepseek-coder", "deepseek-llm", "falcon", "minicpm5",
+        "default", "whitespace", "tekken", "gpt-4o", "llama4", "qwen35",
+        "gemma4", "mellum", "mellum2", "modern-bert", "jina-v5-nano",
+    }
+)
+
+_UNICODE_CLASSES: dict[str, str] = {}
+
+
+def _unicode_ranges(prefix: str) -> str:
+    """Exact ``\\p{X}`` member list (no brackets) built from :mod:`unicodedata`.
+
+    Returned without surrounding brackets so the same ranges can be embedded
+    inside a larger ``[...]`` class as well as used standalone.
+    """
+    cached = _UNICODE_CLASSES.get(prefix)
+    if cached is not None:
+        return cached
+    import unicodedata
+
+    codepoints: list[int] = []
+    for codepoint in range(0x110000):
+        if 0xD800 <= codepoint <= 0xDFFF:
+            continue
+        if unicodedata.category(chr(codepoint)).startswith(prefix):
+            codepoints.append(codepoint)
+    if not codepoints:
+        raise UnsupportedPreTokenizer(f"no Unicode {prefix}* characters found")
+    parts: list[str] = []
+    start = previous = codepoints[0]
+    for codepoint in [*codepoints[1:], -1]:
+        if codepoint == previous + 1:
+            previous = codepoint
+            continue
+        parts.append(_escape_range(start, previous))
+        start = previous = codepoint
+    rendered = "".join(parts)
+    _UNICODE_CLASSES[prefix] = rendered
+    return rendered
+
+
+def _escape_range(start: int, end: int) -> str:
+    def one(codepoint: int) -> str:
+        char = chr(codepoint)
+        if char in "[]\\-^":
+            return "\\" + char
+        if 0x20 <= codepoint < 0x7F:
+            return char
+        if codepoint < 0x10000:
+            return f"\\u{codepoint:04x}"
+        return f"\\U{codepoint:08x}"
+
+    return one(start) if start == end else f"{one(start)}-{one(end)}"
+
+
+def _expand_unicode_properties(pattern: str) -> str:
+    """Replace ``\\p{L}``-style classes with exact Python ``re`` classes.
+
+    Inside a ``[...]`` class the ranges are spliced in bare; outside they are
+    wrapped in brackets.  Getting this wrong silently changes the split.
+    """
+    out: list[str] = []
+    index = 0
+    in_class = False
+    length = len(pattern)
+    while index < length:
+        char = pattern[index]
+        if char == "\\":
+            token = pattern[index: index + 5]
+            if len(token) == 5 and token.startswith("\\p{") and token.endswith("}"):
+                letter = token[3]
+                ranges = _unicode_ranges(letter)
+                out.append(ranges if in_class else "[" + ranges + "]")
+                index += 5
+                continue
+            out.append(pattern[index: index + 2])
+            index += 2
+            continue
+        if char == "[":
+            in_class = True
+        elif char == "]":
+            in_class = False
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+_COMPILED_PRE_TOKENIZERS: dict[str, re.Pattern[str]] = {}
+
+
+def pre_tokenizer_for(pre: str) -> re.Pattern[str]:
+    """Compiled pre-tokenizer for a ``tokenizer.ggml.pre`` value."""
+    cached = _COMPILED_PRE_TOKENIZERS.get(pre)
+    if cached is not None:
+        return cached
+    if pre in MULTI_PATTERN_PRE_TOKENIZERS:
+        raise UnsupportedPreTokenizer(
+            f"tokenizer.ggml.pre={pre!r} uses a multi-regex pre-tokenizer that Pyrite "
+            "does not approximate; refusing to emit token ids it cannot match exactly"
+        )
+    pattern = PRE_TOKENIZER_PATTERNS.get(pre)
+    if pattern is None:
+        raise UnsupportedPreTokenizer(
+            f"tokenizer.ggml.pre={pre!r} has no Pyrite implementation "
+            "(llama.cpp rejects an unknown pre-tokenizer for the same reason); "
+            "supported values: " + ", ".join(sorted(PRE_TOKENIZER_PATTERNS))
+        )
+    compiled = re.compile(_expand_unicode_properties(pattern))
+    _COMPILED_PRE_TOKENIZERS[pre] = compiled
+    return compiled
+
 
 _BYTE_FALLBACK = re.compile(r"^<0x([0-9A-Fa-f]{2})>$")
 
@@ -92,6 +287,8 @@ class GGUFBPETokenizer:
         pad_id: int | None = None,
         token_types: Sequence[int] | None = None,
         model: str = "gpt2",
+        pre: str = "gpt-2",
+        add_bos: bool = False,
     ):
         if not tokens:
             raise ValueError("tokenizer vocabulary is empty")
@@ -101,6 +298,11 @@ class GGUFBPETokenizer:
         self.eos_id = eos_id
         self.pad_id = pad_id
         self.token_types = list(token_types) if token_types else None
+        self.pre = pre
+        self.add_bos = bool(add_bos)
+        # Resolved eagerly so an unsupported pre-tokenizer is reported when the
+        # tokenizer is built, not halfway through encoding a prompt.
+        self.pre_tokenizer = pre_tokenizer_for(pre)
         self._token_to_id: dict[str, int] = {}
         for index, token in enumerate(self.tokens):
             self._token_to_id.setdefault(token, index)
@@ -125,13 +327,16 @@ class GGUFBPETokenizer:
         )
 
     def _is_special(self, index: int, token: str) -> bool:
-        # GGUF token types: 1 normal, 2 unknown, 3 control/special, 4 unused.
-        if (
-            self.token_types is not None
-            and index < len(self.token_types)
-            and int(self.token_types[index]) == 3
-        ):
-            return True
+        """Whether ``token`` is matched verbatim instead of produced by BPE.
+
+        ``gguf.constants.TokenType`` is 1 NORMAL, 2 UNKNOWN, 3 CONTROL,
+        4 USER_DEFINED, 5 UNUSED, 6 BYTE.  llama.cpp treats CONTROL,
+        USER_DEFINED and UNKNOWN as special.  Byte tokens (6) are *not*
+        special: they are the ``<0xXX>`` fallback alphabet.  When a file
+        carries no token-type array, the ``<|...|>`` heuristic is used.
+        """
+        if self.token_types is not None and index < len(self.token_types):
+            return int(self.token_types[index]) in SPECIAL_TOKEN_TYPES
         return token.startswith("<|") and token.endswith("|>")
 
     @property
@@ -143,11 +348,19 @@ class GGUFBPETokenizer:
         return TokenizerSpec(len(self.tokens), self.bos_id, self.eos_id, self.pad_id)
 
     # ------------------------------------------------------------------ encode
-    def encode(self, text: str, *, add_bos: bool = False, allow_special: bool = True) -> list[int]:
+    def encode(
+        self,
+        text: str,
+        *,
+        add_bos: bool | None = None,
+        allow_special: bool = True,
+    ) -> list[int]:
+        """Encode ``text``; ``add_bos=None`` honours ``tokenizer.ggml.add_bos_token``."""
         if not isinstance(text, str):
             raise TypeError("text must be a string")
         ids: list[int] = []
-        if add_bos and self.bos_id is not None:
+        emit_bos = self.add_bos if add_bos is None else add_bos
+        if emit_bos and self.bos_id is not None:
             ids.append(self.bos_id)
         for chunk, is_special in self._split_special(text, allow_special):
             if is_special:
@@ -175,7 +388,7 @@ class GGUFBPETokenizer:
 
     def _encode_ordinary(self, text: str) -> list[int]:
         result: list[int] = []
-        for piece in PRE_TOKEN_PATTERN.findall(text):
+        for piece in self.pre_tokenizer.findall(text):
             symbols = [_BYTE_ENCODER[byte] for byte in piece.encode("utf-8")]
             for symbol in self._apply_merges(symbols):
                 token_id = self._lookup(symbol)
@@ -264,6 +477,7 @@ def load_gguf_tokenizer(reader) -> GGUFBPETokenizer | None:
         value = metadata.get(key)
         return int(value) if isinstance(value, int) else None
 
+    add_bos = metadata.get("tokenizer.ggml.add_bos_token")
     return GGUFBPETokenizer(
         [str(token) for token in tokens],
         [str(merge) for merge in merges],
@@ -272,4 +486,9 @@ def load_gguf_tokenizer(reader) -> GGUFBPETokenizer | None:
         pad_id=optional_id("tokenizer.ggml.padding_token_id"),
         token_types=[int(value) for value in token_types] if token_types else None,
         model=model,
+        # llama.cpp reads this key without a fallback and throws
+        # "unknown pre-tokenizer type: ''" when a BPE file omits it; Pyrite
+        # refuses for the same reason rather than guessing a split rule.
+        pre=str(metadata.get("tokenizer.ggml.pre", "")),
+        add_bos=bool(add_bos) if isinstance(add_bos, (bool, int)) else False,
     )

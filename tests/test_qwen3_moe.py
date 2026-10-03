@@ -42,11 +42,11 @@ def test_qwen3_moe_config_contract():
     assert Qwen3MoEConfig.from_metadata(metadata).rope_theta == 1_000_000.0
 
 
-def test_vocab_size_must_agree_with_the_tokenizer(tmp_path):
-    """A checkpoint whose vocab key disagrees with its tokenizer is refused."""
-    from pyrite.qwen3_moe import Qwen3MoECheckpoint, Qwen3MoEContractError
+def _metadata_only_copy(tmp_path, vocab_size: int):
+    """Rebuild a metadata-only GGUF with a different ``{arch}.vocab_size``."""
+    from pyrite.qwen3_moe import Qwen3MoECheckpoint
     from tests.gguf_builder import GGUFFileBuilder
-    from tests.tiny_qwen3moe import build_tiny_checkpoint, tokenizer_vocab
+    from tests.tiny_qwen3moe import build_tiny_checkpoint
 
     path, _, _ = build_tiny_checkpoint(tmp_path / "tiny.gguf")
     reader_meta = Qwen3MoECheckpoint(path).metadata
@@ -54,8 +54,34 @@ def test_vocab_size_must_agree_with_the_tokenizer(tmp_path):
     for key, value in reader_meta.items():
         if key not in {"general.architecture", "general.alignment", "qwen3moe.vocab_size"}:
             builder.add(key, value)
+    builder.add("qwen3moe.vocab_size", vocab_size)
+    return builder.write(tmp_path / f"vocab{vocab_size}.gguf")
+
+
+def test_larger_declared_vocab_is_treated_as_padding(tmp_path):
+    """``vocab_size`` above the token count means padding, exactly as upstream.
+
+    llama.cpp does ``n_vocab = get_key(VOCAB_SIZE, n_tokens)`` and then pads the
+    vocabulary with dummy tokens, so a declared size above the token count is
+    legitimate - refusing it would reject real checkpoints.
+    """
+    from pyrite.qwen3_moe import Qwen3MoECheckpoint
+    from tests.tiny_qwen3moe import tokenizer_vocab
+
     vocab, _, _, _, _ = tokenizer_vocab()
-    builder.add("qwen3moe.vocab_size", len(vocab) + 100)
-    bad = builder.write(tmp_path / "bad.gguf")
-    with pytest.raises(Qwen3MoEContractError, match=r"self-inconsistent checkpoint"):
+    config = Qwen3MoECheckpoint(_metadata_only_copy(tmp_path, len(vocab) + 100)).config
+    assert config.vocab_size == len(vocab) + 100
+    assert config.vocab_token_count == len(vocab)
+    assert config.vocab_source == "qwen3moe.vocab_size"
+
+
+def test_vocab_size_must_agree_with_the_tokenizer(tmp_path):
+    """A vocab key *below* the token count is refused: ids would run off the end."""
+    from pyrite.qwen3_moe import Qwen3MoECheckpoint, Qwen3MoEContractError
+    from tests.tiny_qwen3moe import tokenizer_vocab
+
+
+    vocab, _, _, _, _ = tokenizer_vocab()
+    bad = _metadata_only_copy(tmp_path, len(vocab) - 50)
+    with pytest.raises(Qwen3MoEContractError, match=r"index past the LM head"):
         Qwen3MoECheckpoint(bad)

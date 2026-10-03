@@ -190,6 +190,10 @@ def make_test_tokenizer():
     from pyrite.tokenizer import GGUFBPETokenizer
 
     vocab, merges, token_types, bos, eos = tokenizer_vocab()
-    return GGUFBPETokenizer(vocab, merges, token_types=token_types, bos_id=bos, eos_id=eos)
+    # pre="qwen2" matches the tokenizer.ggml.pre this module writes into the
+    # GGUF fixtures, so the in-memory tokenizer and the file agree.
+    return GGUFBPETokenizer(
+        vocab, merges, token_types=token_types, bos_id=bos, eos_id=eos, pre="qwen2"
+    )
 
 

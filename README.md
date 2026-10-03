@@ -18,7 +18,7 @@ First-class target: laptops with about 4 GB RAM. The default profile sets a 4096
 - bounded compact KV cache with `stop` and `sliding_window` policies
 - GGUF adapters with per-row quantized-size validation
 - CPU transformer execution for supported dense and MoE architectures
-- optional portable C Q4_K/Q6_K streaming kernels; Python reference decoders remain available
+- optional portable C kernels for 19 GGML types, each cross-checked against the Python reference decoder
 - T-SAR-inspired ternary reference kernel (not the proposed hardware modification)
 
 ## Supported architectures
@@ -29,15 +29,23 @@ Pyrite dispatches on GGUF `general.architecture`:
 - `qwen3` — dense Qwen3 with GQA, QK norm, and dense SwiGLU MLP
 - `llama` — dense Llama with GQA, optional partial rotary dimensions, and dense SwiGLU MLP
 
-Unknown architectures and unsupported tensor types are refused rather than approximated. `qwen3-check --require-canonical` additionally checks the canonical Qwen3-MoE metadata contract of 94 layers, 128 experts, and top-8 routing.
+Unknown architectures and unsupported tensor types are refused rather than approximated. Nothing in the engine requires a particular model size: every dimension comes from the GGUF metadata and is cross-validated against the actual tensor shapes. `qwen3-check --expect-profile NAME` is the opposite of a requirement - it asserts a *declared* expectation (see `pyrite/model_profiles.py` for the published Qwen3 and Qwen3-MoE shapes) and reports a field-by-field diff when the file does not match it.
 
 ## Qwen3 checkpoint validation
 
 ```bash
 python -m pyrite qwen3-check /path/to/model.gguf
 python -m pyrite qwen3-check /path/to/model.gguf --full
-python -m pyrite qwen3-check /path/to/model.gguf --require-canonical
+python -m pyrite qwen3-check /path/to/model.gguf --expect-profile qwen3-235b-a22b
+python -m pyrite plan /path/to/model.gguf
 ```
+
+`qwen3-check` reports the resolved architecture config, the full tensor
+registry, which tensor is the LM head and why, and any tensor type Pyrite cannot
+decode. `plan` reports the checkpoint's real byte footprint, the KV cache size
+for the configured context, the streaming workspace, and the RAM this machine
+actually has (from `/proc/meminfo`, falling back to `os.sysconf`), and says
+plainly whether the run fits.
 
 The full report includes tensor sizes, the largest streamed row or expert slice, and whether those ranges fit the current budget. For the Qwen3-235B-A22B-Instruct-2507 GGUF family, Q4_K_M is published as five split files; use `llama-gguf-split` to merge them before passing a single GGUF file to Pyrite. The full Q4_K_M set is roughly 142 GB. A 4 GB setting bounds resident memory; it does not make the full model fit on disk or make a large KV context affordable.
 
@@ -52,17 +60,57 @@ python -m pyrite.bench --checkpoint model.gguf --tokens 8
 
 The executor streams dense projection rows, selected MoE expert slices, and vocabulary rows; it does not materialize the whole model. KV entries are stored as compact fp32 arrays. The default `stop` policy ends generation when the configured KV limit is reached; `sliding_window` evicts the oldest KV entries and continues up to the model/runtime context limit.
 
-A C compiler (`cc`, `gcc`, or `clang`) enables the optional scalar C Q4_K/Q6_K kernels. Pyrite compiles the small, Python-header-free C source into the system temporary directory on first use, borrows quantized buffers without copying them, and fuses dequantization with matrix-vector multiplication. If compilation is unavailable, those types use the bounded Python reference path instead. This is not a throughput claim: transformer orchestration and non-Q4_K/Q6_K tensor types still use Python, and no published-checkpoint performance result is claimed here.
+A C compiler (`cc`, `gcc`, or `clang`) enables the optional scalar C kernels.
+Pyrite compiles the small, Python-header-free C source into the system temporary
+directory on first use, borrows quantized buffers without copying them, and fuses
+dequantization with matrix-vector multiplication. If compilation is unavailable,
+every type falls back to the bounded Python reference path instead.
 
-Reference decoders cover F32, F16, BF16, F64, I8/I16/I32/I64, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1, and Q2_K through Q6_K. No runtime oracle, cloud service, or network access is required for inference.
+Native kernels cover F32, F16, BF16, F64, I8/I16/I32/I64, Q4_0, Q4_1, Q5_0,
+Q5_1, Q8_0, Q8_1, Q2_K, Q4_K, Q5_K, Q6_K and IQ4_NL - 19 types, each
+cross-checked against the Python decoder in `tests/test_native_kernels.py`.
+The Python reference path additionally decodes IQ4_XS. No runtime oracle, cloud
+service, or network access is required for inference.
+
+Measured on 2 CPU cores with no GPU: a 1.41 GB, 28-layer Qwen3-shaped checkpoint
+runs at about 0.8 prefill tokens/s and 0.69 decode tokens/s with a 1374 MiB peak
+RSS. See [`docs/validation.md`](docs/validation.md) for the full numbers.
+
+## Tokenizer
+
+Byte-level BPE from GGUF metadata, with the pre-tokenizer regex selected from
+`tokenizer.ggml.pre`. Supported families: qwen2 (and its aliases), llama3 /
+llama-bpe / dbrx / smaug-bpe, gpt-2 / mpt / olmo / starcoder / refact /
+command-r / smollm / codeshell / exaone, and poro-chat / bloom / gpt3-finnish.
+Unicode property classes (`\p{L}`, `\p{N}`, `\p{P}`, `\p{M}`, `\p{S}`) are
+expanded from `unicodedata`, not approximated by Python's `\w`/`\d`.
+
+Pre-tokenizers that llama.cpp implements as a *sequence* of regexes
+(`default`, `chameleon`, `deepseek-coder`, `deepseek-llm`, `falcon`, `gpt-4o`,
+`llama4`, `qwen35`, `tekken` and others) raise `UnsupportedPreTokenizer` rather
+than emit plausible-looking but wrong token ids. A GGUF that omits
+`tokenizer.ggml.pre` is refused for the same reason llama.cpp refuses it.
+
+Verified against llama.cpp on a real 151,936-token Qwen2 vocabulary: 9/9 corpus
+cases produce byte-identical token ids, including Devanagari, mixed scripts,
+digits, punctuation and the Qwen chat control tokens.
 
 ## Validation
 
-`scripts/llama_crosscheck.py` can compare Pyrite with official `llama.cpp` binaries on locally generated GGUF fixtures (decoder parity, deterministic generation, and perplexity). The measured fixture results and remaining gaps are recorded in [`docs/validation.md`](docs/validation.md). A fixture crosscheck does not substitute for running a published checkpoint.
+Two scripts compare Pyrite against a real `llama.cpp` build:
 
 ```bash
+python scripts/llama_reference_compare.py --llama-bin /path/to/llama.cpp/build/bin \
+    --vocab-gguf models/ggml-vocab-qwen2.gguf --model-gguf models/qwen3-vocab-fixture.gguf
 python scripts/llama_crosscheck.py --llama-bin /path/to/llama.cpp/build/bin
 ```
+
+The measured results are in [`docs/validation.md`](docs/validation.md). On the
+same GGUF, with the same prompt and greedy decoding, Pyrite and llama.cpp
+produced 12 identical tokens. That checkpoint has random weights, so it validates
+the arithmetic, not model quality; no published Qwen3 checkpoint could be
+downloaded in the environment where this was measured, and none is claimed to
+have been run.
 
 ## Privacy
 

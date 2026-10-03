@@ -19,12 +19,13 @@ from time import perf_counter
 from .adapters.gguf_adapter import GGUFAdapter
 from .config import RuntimeConfig
 from .engine import PyriteRuntime
+from .ggml_types import row_size, type_name
 from .ggml_types import spec as ggml_spec
-from .ggml_types import type_name
 from .kernels.native import dequantize_rows as native_dequantize_rows
 from .kernels.native import matvec as native_matvec
-from .kernels.native import native_available, supports_native
+from .kernels.native import native_available, sorted_native_types, supports_native
 from .memory import RSSMonitor
+from .memory_plan import MemoryPlan, require_plan
 from .qwen3_moe import EXPERT_TENSORS, Qwen3MoECheckpoint, TensorSlice
 from .sampler import Sampler
 from .stream import BlockStreamer
@@ -227,6 +228,10 @@ class Qwen3MoEExecutor:
         if requested_stream_bytes <= 0:
             raise ValueError("resident_bytes must be positive")
         self.resident_bytes = min(requested_stream_bytes, available_stream_bytes)
+        # Real memory accounting: refuse to start a run this machine cannot
+        # actually hold, with the concrete numbers in the error.
+        self._memory_plan = build_memory_plan(self, working_set)
+        require_plan(self._memory_plan, what="run this checkpoint")
         if max_tensor_bytes is not None and max_tensor_bytes <= 0:
             raise ValueError("max_tensor_bytes must be positive when provided")
         self.max_tensor_bytes = (
@@ -839,7 +844,12 @@ class Qwen3MoEExecutor:
             self._dense_vector("output_norm.weight"),
             self.checkpoint.config.rms_norm_eps,
         )
-        output_name = "output.weight" if self.checkpoint.has_tensor("output.weight") else "token_embd.weight"
+        # The LM head is resolved by the checkpoint contract: output.weight when
+        # the file has one, otherwise the tied token-embedding matrix.  Shape and
+        # quantization type are validated during that resolution, so a checkpoint
+        # that can legally tie is never rejected and one that cannot is reported
+        # with the reason.
+        output_name = self.checkpoint.lm_head.tensor_name
         self.stats.steps += 1
         output_tensor = self.checkpoint.tensor(output_name)
         output_cols, output_rows = output_tensor.dims
@@ -970,6 +980,8 @@ class Qwen3MoEExecutor:
             "vocab_size": cfg.vocab_size,
             "tensor_count": self.checkpoint.tensor_count,
             "total_bytes": total_bytes,
+            "lm_head": self.checkpoint.lm_head.to_dict(),
+            "vocab_token_count": cfg.vocab_token_count,
             "resident_budget_bytes": self.resident_bytes,
             "working_set_budget_bytes": self.runtime.config.resident_byte_budget,
             "rss_limit_bytes": self.runtime.config.ram_budget_mb * 1024 * 1024,
@@ -977,10 +989,42 @@ class Qwen3MoEExecutor:
             "kv_cache_policy": self.runtime.config.kv_cache_policy,
             "cpu_execution": True,
             "native_kernel_available": native_available(),
-            "native_kernel_types": ["Q4_K", "Q6_K"] if native_available() else [],
+            "native_kernel_types": sorted_native_types(),
             "unsupported_tensor_types": list(self.unsupported_tensor_types()),
             "tokenizer": type(self.tokenizer).__name__,
         }
+
+
+def build_memory_plan(executor: Qwen3MoEExecutor, working_set_bytes: int) -> MemoryPlan:
+    """Memory accounting for an already-configured executor.
+
+    Called from ``__init__`` once the KV and streaming budgets are fixed, so the
+    numbers reported are the ones the run will actually use - not an estimate
+    made before the config was resolved.
+    """
+    from .memory_plan import measure_model, plan_memory
+
+    cfg = executor.checkpoint.config
+    tensors = executor.checkpoint.reader.tensor_index()
+    largest_row = max(
+        (
+            row_size(tensor.dims[0], tensor.ggml_type)
+            for tensor in tensors
+            if tensor.dims
+        ),
+        default=0,
+    )
+    return plan_memory(
+        measure_model(
+            executor.path,
+            tensors,
+            largest_streamed_unit=max(largest_row, 1) if largest_row else None,
+        ),
+        num_layers=cfg.num_hidden_layers,
+        kv_cache_dim=cfg.kv_cache_dim,
+        max_kv_tokens=executor.runtime.config.max_kv_tokens,
+        working_set_bytes=working_set_bytes,
+    )
 
 
 def detect_architecture(path: str | Path) -> str:

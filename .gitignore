@@ -5,3 +5,5 @@ __pycache__/
 .pyrite/
 *.egg-info/
 .ruff_cache/
+*.gguf
+models/

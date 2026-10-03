@@ -1,0 +1,58 @@
+{
+  "model": "Qwen3 dense",
+  "architecture": "qwen3",
+  "config": {
+    "architecture": "qwen3",
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "value_dim": 16,
+    "rotary_dim": 16,
+    "vocab_size": 151936,
+    "rms_norm_eps": 9.999999747378752e-06,
+    "rope_theta": 500000.0,
+    "max_position_embeddings": 512,
+    "bos_token_id": 151643,
+    "eos_token_id": 151643,
+    "tie_word_embeddings": false,
+    "has_qk_norm": true,
+    "vocab_token_count": 151936,
+    "vocab_source": "tokenizer.ggml.tokens",
+    "tie_declared": false
+  },
+  "validation": {
+    "architecture": "qwen3",
+    "layers": 2,
+    "vocab_size": 151936,
+    "vocab_token_count": 151936,
+    "vocab_source": "tokenizer.ggml.tokens",
+    "lm_head": {
+      "tensor": "output.weight",
+      "tied": false,
+      "declared_tied": false,
+      "shape": [
+        64,
+        151936
+      ],
+      "type": "F32",
+      "source": "output.weight is present, so it is the LM head"
+    },
+    "unsupported_tensor_types": [],
+    "tensor_types_decodable": true,
+    "native_generation_ready": true
+  },
+  "streaming": {
+    "resident_bytes": 3388555264,
+    "tensor_count": 25,
+    "total_bytes": 78087680,
+    "oversized_tensors": 0,
+    "largest_tensor_bytes": 38895616,
+    "largest_row_bytes": 512,
+    "can_stream_storage": true,
+    "whole_model_residency_required": false,
+    "full_model_loaded": false
+  }
+}
