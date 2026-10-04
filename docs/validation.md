@@ -59,16 +59,17 @@ cmake --build build -j2 --target llama-tokenize llama-completion
 
 ```
 $ python3 -m pytest -q
-335 passed in 31.83s
+338 passed in 19.88s
 ```
 
-The baseline before this round of work was **249 passed**; 86 tests were added.
-No test is skipped on this machine.
+The baseline before this round of work was **249 passed**; 89 tests were added.
+No test is skipped: the checkpoint-shape tests build their fixtures themselves
+rather than reading files that are not in the repository.
 
 | New file | What it pins |
 | --- | --- |
 | `tests/test_lm_head.py` | The exact `output.weight` regression; untied, tied, tied-by-omission and genuinely-missing LM heads; vocabulary resolution and its conflict rules. |
-| `tests/test_native_kernels.py` | All 19 native C kernels cross-checked against the Python reference decoders (`dequantize_rows` and `matvec`). |
+| `tests/test_native_kernels.py` | All 21 native C kernels cross-checked against the Python reference decoders (`dequantize_rows` and `matvec`), plus a guard that no decodable type is left without one. |
 | `tests/test_gguf_errors.py` | Corrupt magic, versions, counts, string lengths, tensor names, dimension counts, unknown types, out-of-range offsets, duplicates, alignment, truncated payloads. |
 | `tests/test_memory_plan.py` | KV estimate, `/proc/meminfo` units, footprint, plan acceptance/refusal, streaming note for larger-than-RAM models. |
 | `tests/test_tokenizer.py` | Per-`pre` pre-tokenizer semantics; refusal of multi-regex and missing `pre`. |
@@ -293,8 +294,6 @@ is the script reproduced in `validation/benchmark-qwen3-0p6b-shape.txt`.
 
 ## Known limitations
 
-- **IQ4_XS is decoded in Python only.** The other 19 native types have C
-  kernels; IQ4_XS works but is slower.
 - **Multi-regex pre-tokenizers are refused, not approximated.** `chameleon`,
   `deepseek-coder`, `deepseek-llm`, `falcon`, `gpt-4o`, `llama4`, `qwen35`,
   `tekken`, `default` and others apply a *sequence* of regexes in llama.cpp.

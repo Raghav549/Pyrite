@@ -38,10 +38,12 @@ NATIVE_TYPES = frozenset({
     8,   # Q8_0
     9,   # Q8_1
     10,  # Q2_K
+    11,  # Q3_K
     12,  # Q4_K
     13,  # Q5_K
     14,  # Q6_K
     20,  # IQ4_NL
+    23,  # IQ4_XS
     24,  # I8
     25,  # I16
     26,  # I32

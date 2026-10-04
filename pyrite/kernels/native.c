@@ -123,6 +123,53 @@ static double dot_q6_k(const uint8_t *block, const double *x) {
     return sum;
 }
 
+/* block_q3_K is 110 bytes for 256 values: hmask[32] | qs[64] | scales[12] |
+ * d (half).  The 12 scale bytes hold sixteen 6-bit values; the packing undone
+ * here is the one ggml-quants.c applies when quantizing. */
+static void decode_q3_k(const uint8_t *block, double *out) {
+    const uint8_t *hmask = block;
+    const uint8_t *quants = block + 32;
+    const double d = (double)fp16_to_float(read_le16(block + 108));
+
+    uint32_t aux[4] = {0u, 0u, 0u, 0u};
+    memcpy(aux, block + 96, 12);
+    const uint32_t tmp = aux[2];
+    uint32_t packed[4];
+    packed[2] = ((aux[0] >> 4) & 0x0F0F0F0Fu) | (((tmp >> 4) & 0x03030303u) << 4);
+    packed[3] = ((aux[1] >> 4) & 0x0F0F0F0Fu) | (((tmp >> 6) & 0x03030303u) << 4);
+    packed[0] = (aux[0] & 0x0F0F0F0Fu) | (((tmp >> 0) & 0x03030303u) << 4);
+    packed[1] = (aux[1] & 0x0F0F0F0Fu) | (((tmp >> 2) & 0x03030303u) << 4);
+    int8_t scales[16];
+    memcpy(scales, packed, 16);
+
+    int is = 0;
+    int q = 0;
+    int m = 1;
+    for (int outer = 0; outer < 256; outer += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; ++j) {
+            /* Brackets matter: d * ((double)scale - 32.0). */
+            double dl = d * ((double)scales[is] - 32.0);
+            ++is;
+            for (int l = 0; l < 16; ++l) {
+                const int value =
+                    (int)((quants[q + l] >> shift) & 3) - ((hmask[l] & m) ? 0 : 4);
+                out[outer + shift * 16 + l] = dl * (double)value;
+            }
+            dl = d * ((double)scales[is] - 32.0);
+            ++is;
+            for (int l = 0; l < 16; ++l) {
+                const int value =
+                    (int)((quants[q + 16 + l] >> shift) & 3) - ((hmask[16 + l] & m) ? 0 : 4);
+                out[outer + shift * 16 + 16 + l] = dl * (double)value;
+            }
+            shift += 2;
+            m = (m << 1) & 0xFF;
+        }
+        q += 32;
+    }
+}
+
 static void decode_q4_k(const uint8_t *block, double *out) {
     const double d = (double)fp16_to_float(read_le16(block));
     const double dmin = (double)fp16_to_float(read_le16(block + 2));
@@ -310,6 +357,27 @@ static void decode_iq4_nl(const uint8_t *block, double *out) {
     }
 }
 
+/* block_iq4_xs is 136 bytes for 256 values: d (half), scales_h (u16),
+ * scales_l[4], qs[128].  Eight 32-value sub-blocks, each with a 6-bit scale
+ * split across scales_l and scales_h and offset by -32.  Mirrors
+ * dequantize_row_iq4_xs in ggml/src/ggml-quants.c. */
+static void decode_iq4_xs(const uint8_t *block, double *out) {
+    const double d = (double)fp16_to_float(read_le16(block));
+    const unsigned int scales_h = (unsigned int)read_le16(block + 2);
+    const uint8_t *scales_l = block + 4;
+    const uint8_t *qs = block + 8;
+    for (int sub = 0; sub < 8; ++sub) {
+        const int ls = ((int)(scales_l[sub / 2] >> (4 * (sub % 2))) & 0x0f)
+                     | (int)(((scales_h >> (2 * sub)) & 3u) << 4);
+        /* Brackets matter: d * ((double)ls - 32.0), not (d * ls) - 32.0. */
+        const double dl = d * ((double)ls - 32.0);
+        for (int j = 0; j < 16; ++j) {
+            out[sub * 32 + j] = dl * (double)KVALUES_IQ4NL[qs[sub * 16 + j] & 0x0f];
+            out[sub * 32 + j + 16] = dl * (double)KVALUES_IQ4NL[qs[sub * 16 + j] >> 4];
+        }
+    }
+}
+
 static void decode_q2_k(const uint8_t *block, double *out) {
     const uint8_t *scales = block;
     const uint8_t *quants = block + 16;
@@ -390,10 +458,12 @@ static const pyrite_type PYRITE_TYPES[] = {
     { 8,  32,  34, decode_q8_0  },
     { 9,  32,  36, decode_q8_1  },
     { 10, 256, 84, decode_q2_k  },
+    { 11, 256, 110, decode_q3_k },
     { 12, 256, 144, decode_q4_k },
     { 13, 256, 176, decode_q5_k },
     { 14, 256, 210, decode_q6_k },
     { 20, 32,  18, decode_iq4_nl },
+    { 23, 256, 136, decode_iq4_xs },
     { 24, 1,   1, decode_i8     },
     { 25, 1,   2, decode_i16    },
     { 26, 1,   4, decode_i32    },

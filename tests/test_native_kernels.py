@@ -154,5 +154,16 @@ def test_native_kernels_match_the_reference_quantizer(ggml_type: int) -> None:
 def test_supports_native_reports_the_table() -> None:
     for ggml_type in native_type_ids():
         assert supports_native(ggml_type) is True
-    # IQ4_XS is decoded in Python only; it must not be claimed as native.
-    assert supports_native(23) is False
+    # TQ1_0 (21) / TQ2_0 (35) have no decoder in either path.
+    assert supports_native(21) is False
+    assert supports_native(35) is False
+
+
+def test_every_decodable_type_has_a_native_kernel() -> None:
+    """No decodable type may be silently left on the slow Python path.
+
+    If this fails, a type Pyrite can decode has lost its C kernel, which costs
+    throughput with no error anywhere.
+    """
+    missing = set(DECODABLE_TYPES) - set(native_type_ids())
+    assert not missing, f"decodable types with no native kernel: {sorted(missing)}"

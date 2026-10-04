@@ -66,11 +66,12 @@ directory on first use, borrows quantized buffers without copying them, and fuse
 dequantization with matrix-vector multiplication. If compilation is unavailable,
 every type falls back to the bounded Python reference path instead.
 
-Native kernels cover F32, F16, BF16, F64, I8/I16/I32/I64, Q4_0, Q4_1, Q5_0,
-Q5_1, Q8_0, Q8_1, Q2_K, Q4_K, Q5_K, Q6_K and IQ4_NL - 19 types, each
-cross-checked against the Python decoder in `tests/test_native_kernels.py`.
-The Python reference path additionally decodes IQ4_XS. No runtime oracle, cloud
-service, or network access is required for inference.
+Native kernels cover all 21 decodable GGML types - F32, F16, BF16, F64,
+I8/I16/I32/I64, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K,
+Q6_K, IQ4_NL and IQ4_XS - each cross-checked against its Python reference
+decoder in `tests/test_native_kernels.py`, which fails if any decodable type
+loses its C kernel. No runtime oracle, cloud service, or network access is
+required for inference.
 
 Measured on 2 CPU cores with no GPU: a 1.41 GB, 28-layer Qwen3-shaped checkpoint
 runs at about 0.8 prefill tokens/s and 0.69 decode tokens/s with a 1374 MiB peak

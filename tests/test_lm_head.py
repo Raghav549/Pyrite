@@ -238,17 +238,45 @@ def test_vocab_conflict_between_metadata_and_embedding_is_refused() -> None:
 # --------------------------------------------------------------------------- #
 # End to end, on a real file
 # --------------------------------------------------------------------------- #
-def test_real_fixture_without_vocab_metadata_still_validates() -> None:
-    """``qwen3-f32-fixture.gguf`` declares no vocab keys at all.
+def test_checkpoint_without_vocab_metadata_still_validates(tmp_path: Path) -> None:
+    """A checkpoint that declares no vocab keys at all must still load.
 
-    It used to fail with "GGUF is missing required qwen3 metadata"; it must now
-    resolve the vocabulary from the embedding rows and find its LM head.
+    This reproduces the real downloaded ``qwen3-f32-fixture.gguf``: 25 tensors
+    including ``output.weight``, and *no* ``tokenizer.ggml.tokens`` and *no*
+    ``qwen3.vocab_size``.  It used to fail with "GGUF is missing required qwen3
+    metadata", which named the wrong thing - the metadata that was actually
+    missing was the vocabulary, and the tensor that was actually present was the
+    LM head.
+
+    Built here rather than read from a downloaded file so it always runs.
     """
+    from pyrite.adapters.gguf import GGUFReader
     from pyrite.dense import DenseCheckpoint
 
-    path = Path("/home/user/models/qwen3-f32-fixture.gguf")
-    if not path.is_file():
-        pytest.skip("the downloaded fixture is not present on this machine")
+    from .gguf_builder import GGUFFileBuilder
+    from .tiny_dense import TinyDenseConfig, build_tiny_dense_checkpoint
+
+    source, _cfg, _tensors = build_tiny_dense_checkpoint(
+        tmp_path / "with-vocab.gguf", TinyDenseConfig(architecture="qwen3")
+    )
+    reader = GGUFReader(source)
+    rebuilt = GGUFFileBuilder("qwen3")
+    for key, value in reader.metadata().items():
+        if key.startswith("tokenizer."):
+            continue  # strip exactly what the real fixture lacks
+        if key in ("general.architecture", "general.alignment"):
+            continue  # the builder writes these itself
+        rebuilt.add(key, value)
+    for tensor in reader.tensor_index():
+        rebuilt.add_tensor(
+            tensor.name, tensor.dims, tensor.ggml_type, reader.read_tensor(tensor)
+        )
+    path = rebuilt.write(tmp_path / "no-vocab.gguf")
+
+    assert not any(
+        key.startswith("tokenizer.") for key in GGUFReader(path).metadata()
+    ), "the fixture must declare no vocabulary keys"
+
     checkpoint = DenseCheckpoint(path)
     summary = checkpoint.validate_contract()
     assert summary["lm_head"]["tensor"] == "output.weight"
