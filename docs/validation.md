@@ -59,10 +59,10 @@ cmake --build build -j2 --target llama-tokenize llama-completion
 
 ```
 $ python3 -m pytest -q
-339 passed in 20.43s
+345 passed in 19.73s
 ```
 
-The baseline before this round of work was **249 passed**; 90 tests were added.
+The baseline before this round of work was **249 passed**; 96 tests were added.
 No test is skipped: the checkpoint-shape tests build their fixtures themselves
 rather than reading files that are not in the repository.
 
@@ -292,8 +292,15 @@ is the script reproduced in `validation/benchmark-qwen3-0p6b-shape.txt`.
   ids. Supported: the qwen2, llama3/llama-bpe, gpt-2 and poro/bloom families.
 - **A GGUF with no `tokenizer.ggml.pre` is refused.** llama.cpp throws for an
   unknown pre-tokenizer for the same reason.
-- **`_apply_merges` is O(n^2)** in the number of symbols in a piece. Long pieces
-  in a large vocabulary are slower than they need to be.
+- **`_apply_merges` is O(n^2)** in the number of symbols in a piece
+  (`pyrite/tokenizer.py:401-419`), and has deliberately been left that way.
+  Measured on the real 151,936-token vocabulary: a 200-word sentence encodes in
+  **8.1 ms**, a 1,000-character word in **70 ms**, a pathological
+  4,000-character word in **694 ms**. Real pre-tokenized pieces are short, so
+  the quadratic term never dominates on real text. A heap with lazy
+  invalidation would change the merge tie-breaking, putting the single most
+  heavily verified property here - token ids identical to llama.cpp - at risk
+  to speed up inputs that do not occur.
 - **`generate_text` hides special tokens.** It decodes with
   `skip_special=True`, so a generated `USER_DEFINED` or `CONTROL` token does not
   appear in the returned string even though it is in `output_ids`. That is
@@ -301,16 +308,59 @@ is the script reproduced in `validation/benchmark-qwen3-0p6b-shape.txt`.
   decode with `skip_special=False` or it will report a difference that is not
   there. This already produced one wrong conclusion, recorded above.
 - **No GPU path.** Everything runs on CPU; there is no CUDA or Metal backend.
-- **No published MoE checkpoint was run.** The MoE cross-check above uses a
-  locally built checkpoint with 4 experts, top-2 routing and random weights. The
-  routing path is verified against llama.cpp, but nothing at 128-expert scale
-  was executed here.
+- **No published MoE checkpoint was run.** Every MoE cross-check above uses a
+  locally built checkpoint with random weights. That now covers both the small
+  (4 experts, top-2) and the published-scale (128 experts, top-8) routing path,
+  and both agree with llama.cpp - but a real released Qwen3-MoE file has still
+  never been loaded here, so weight-loading for an actual published checkpoint
+  is unverified for the MoE architecture.
+
+## Quantized checkpoints (the case this project started from)
+
+The original failure was on `Qwen3-0.6B-Q8_0.gguf`, so quantized storage is a
+first-class case rather than an afterthought.
+`scripts/build_vocab_fixture.py --quant q8_0|q4_0` emits Q8_0/Q4_0 weights with
+encoders that mirror `quantize_row_q8_0_ref` and `quantize_row_q4_0_ref` in
+`ggml/src/ggml-quants.c`, over the same real 151,936-token Qwen2 vocabulary.
+Pyrite decodes with the same arithmetic ggml does - `dequantize_row_q8_0` is
+literally `y = qs[j] * d`.
+
+Greedy generation against `llama-completion --temp 0`, 32 tokens each, on
+checkpoints whose **LM head is itself quantized**:
+
+| checkpoint | LM head | identical over 32 tokens |
+| --- | --- | --- |
+| `qwen3-q8_0-fixture.gguf` (26,646,944 B) | `output.weight [64, 151936] Q8_0` | 2/2 |
+| `qwen3-q4_0-fixture.gguf` (16,898,464 B) | `output.weight [64, 151936] Q4_0` | 2/2 |
+
+**4/4 byte-identical** - `validation/quantized-crosscheck.txt`.
+
+Two constraints surfaced while building those files and are now enforced in the
+fixture builder and pinned by `tests/test_quantized_checkpoint.py`:
+
+- **RMSNorm weights must stay F32 in a quantized file.** Quantizing them makes
+  ggml abort with `binary_op: unsupported types: dst: f32, src0: f32, src1:
+  q8_0` - its CPU element-wise ops refuse a mixed-type operand. Reproduced
+  against llama.cpp master before the rule was written down. Every real
+  quantized GGUF leaves `*_norm.weight` in F32 for exactly this reason.
+- **Block alignment is per row, not per tensor.** ggml quantizes block by block
+  *within a row*, so `dims[0]` must be a multiple of the block size; a total
+  element count that happens to divide is not enough. `attn_q_norm` (16
+  elements) and `ffn_down` in a 48-wide FFN both fail that test and stay F32.
+
+```bash
+python3 scripts/build_vocab_fixture.py --vocab-gguf models/ggml-vocab-qwen2.gguf \
+  --out qwen3-q8_0.gguf --quant q8_0 --architecture qwen3 \
+  --hidden-size 64 --num-layers 2 --intermediate-size 64 \
+  --num-heads 4 --num-kv-heads 2 --head-dim 16 --max-context 512
+```
 
 ## Artifacts
 
 | Path | Contents |
 | --- | --- |
 | `validation/generation-qwen3-vocab.json` | Pyrite generation on the real-vocab Qwen3 fixture. |
+| `validation/quantized-crosscheck.txt` | Q8_0 / Q4_0 greedy generation vs llama.cpp: 4/4 identical. |
 | `validation/pyrite-generation.txt` | Pyrite's completion text. |
 | `validation/llama-cpp-generation.txt` | llama.cpp's completion text, same prompt. |
 | `validation/benchmark-qwen3-0p6b-shape.txt` | The benchmark above. |
@@ -319,5 +369,5 @@ is the script reproduced in `validation/benchmark-qwen3-0p6b-shape.txt`.
 | `validation/moe-crosscheck.txt` | The Qwen3-MoE generation cross-check against llama.cpp. |
 | `validation/greedy-divergence-check.txt` | 6/6 greedy runs, 48 tokens each, both architectures. |
 | `validation/bench-cli.json` | `pyrite bench` output, including the machine description. |
-| `validation/moe-128-expert-crosscheck.txt` | 128-expert top-8 cross-check: 2/3 identical. |
-| `validation/moe-128e-router-margin.txt` | The router margins that explain the divergence. |
+| `validation/moe-128-expert-crosscheck.txt` | 128-expert top-8 cross-check: 3/3 identical. |
+| `validation/moe-128e-router-margin.txt` | Router softmax margins - real, but not the cause of anything (see the correction above). |

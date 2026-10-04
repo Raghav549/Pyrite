@@ -31,6 +31,66 @@ from pyrite.adapters.gguf import GGUFReader
 from tests.gguf_builder import INT32, GGUFFileBuilder
 from tests.tiny_dense import TinyDenseConfig
 
+# GGML type ids for the quantizations this script can emit.
+QUANT_TYPES: dict[str, int] = {"f32": 0, "q8_0": 8, "q4_0": 2}
+
+
+def _f16(value: float) -> bytes:
+    """IEEE half, little-endian, via struct (no numpy needed)."""
+    import struct
+
+    return struct.pack("<e", value)
+
+
+def _round_half_away(value: float) -> int:
+    """C's ``roundf``: halves go away from zero, not to even.
+
+    Python's built-in ``round`` is banker's rounding, so it disagrees with ggml
+    on exact halves (``round(0.5) == 0`` but ``roundf(0.5f) == 1``).
+    """
+    return int(value + 0.5) if value >= 0 else -int(-value + 0.5)
+
+
+def encode_q8_0(values: list[float]) -> bytes:
+    """Mirror ``quantize_row_q8_0_ref`` in ggml/src/ggml-quants.c."""
+    out = bytearray()
+    for start in range(0, len(values), 32):
+        block = values[start : start + 32]
+        if len(block) < 32:
+            block = block + [0.0] * (32 - len(block))
+        amax = max((abs(v) for v in block), default=0.0)
+        d = amax / 127.0
+        inv = (1.0 / d) if d else 0.0
+        out += _f16(d)
+        out += bytes(max(-127, min(127, _round_half_away(v * inv))) & 0xFF for v in block)
+    return bytes(out)
+
+
+def encode_q4_0(values: list[float]) -> bytes:
+    """Mirror ``quantize_row_q4_0_ref``: ``d = max / -8``, nibbles offset by 8."""
+    out = bytearray()
+    for start in range(0, len(values), 32):
+        block = values[start : start + 32]
+        if len(block) < 32:
+            block = block + [0.0] * (32 - len(block))
+        amax = 0.0
+        best = 0.0
+        for v in block:
+            if amax < abs(v):
+                amax = abs(v)
+                best = v
+        d = best / -8.0
+        inv = (1.0 / d) if d else 0.0
+        out += _f16(d)
+        for j in range(16):
+            lo = min(15, max(0, int(block[j] * inv + 8.5)))
+            hi = min(15, max(0, int(block[j + 16] * inv + 8.5)))
+            out.append(lo | (hi << 4))
+    return bytes(out)
+
+
+QUANT_ENCODERS = {8: encode_q8_0, 2: encode_q4_0}
+
 
 def load_real_vocab(path: Path) -> dict[str, object]:
     reader = GGUFReader(path)
@@ -69,6 +129,8 @@ def build(
     num_experts: int = 0,
     num_experts_used: int = 0,
     moe_ffn: int = 0,
+    quant: str = "f32",
+    keep_f32: tuple[str, ...] = (),
 ) -> Path:
     tokens = list(vocab["tokens"])  # type: ignore[arg-type]
     vocab_size = len(tokens)
@@ -92,14 +154,38 @@ def build(
         for dim in dims:
             elements *= dim
 
-        def produce(_name=name, _elements=elements, _scale=scale) -> bytes:
-            # Generated when the file is written, so peak memory is one tensor.
-            values = array(
-                "f", ((next_float() * 2.0 - 1.0) * _scale for _ in range(_elements))
-            )
-            return values.tobytes()
+        from pyrite.ggml_types import spec
 
-        builder.add_tensor_lazy(name, dims, 0, produce)
+        ggml_type = QUANT_TYPES[quant]
+        if ggml_type != 0 and name.endswith("_norm.weight"):
+            # RMSNorm weights are multiplied element-wise against f32
+            # activations, and ggml's CPU binary ops refuse a mixed-type
+            # operand ("binary_op: unsupported types: dst f32, src1 q8_0").
+            # Every real quantized GGUF leaves the norm vectors in F32 for
+            # exactly this reason, so this fixture does too.
+            ggml_type = 0
+        if ggml_type != 0 and any(name.startswith(prefix) for prefix in keep_f32):
+            ggml_type = 0
+        if ggml_type != 0:
+            # ggml quantizes block by block *within a row*, so it is the row
+            # length (dims[0]) that has to be a multiple of the block size; a
+            # total element count that happens to divide is not enough.  Real
+            # quantized GGUFs leave exactly the tensors that fail this test -
+            # the small norm vectors - in F32, and so does llama.cpp's loader.
+            row_length = dims[0] if dims else 1
+            if row_length % spec(ggml_type).block_size:
+                ggml_type = 0
+
+        def produce(_name=name, _elements=elements, _scale=scale, _type=ggml_type) -> bytes:
+            # Generated when the file is written, so peak memory is one tensor.
+            values = [
+                (next_float() * 2.0 - 1.0) * _scale for _ in range(_elements)
+            ]
+            if _type == 0:
+                return array("f", values).tobytes()
+            return QUANT_ENCODERS[_type](values)
+
+        builder.add_tensor_lazy(name, dims, ggml_type, produce)
 
     is_moe = architecture == "qwen3moe"
     if is_moe and min(num_experts, num_experts_used, moe_ffn) <= 0:
@@ -204,6 +290,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--experts", type=int, default=0, help="qwen3moe routed expert count")
     parser.add_argument("--experts-used", type=int, default=0, help="qwen3moe top-k")
     parser.add_argument("--moe-ffn", type=int, default=0, help="qwen3moe per-expert FFN width")
+    parser.add_argument(
+        "--quant",
+        default="f32",
+        choices=tuple(QUANT_TYPES),
+        help="GGML quantization for the weight tensors",
+    )
+    parser.add_argument(
+        "--keep-f32",
+        default="",
+        help="comma-separated tensor-name prefixes to leave in F32",
+    )
     args = parser.parse_args(argv)
 
     vocab = load_real_vocab(args.vocab_gguf)
@@ -222,11 +319,13 @@ def main(argv: list[str] | None = None) -> int:
         num_experts=args.experts,
         num_experts_used=args.experts_used,
         moe_ffn=args.moe_ffn,
+        quant=args.quant,
+        keep_f32=tuple(args.keep_f32.split(",")) if args.keep_f32 else (),
     )
     print(
         f"wrote {path} ({path.stat().st_size:,} bytes) arch={args.architecture} "
         f"vocab={len(vocab['tokens'])} pre={vocab['pre']!r} "
-        f"layers={args.num_layers} hidden={args.hidden_size}"
+        f"layers={args.num_layers} hidden={args.hidden_size} quant={args.quant}"
     )
     return 0
 
