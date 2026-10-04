@@ -225,3 +225,102 @@ def test_qwen35_is_identical_to_qwen2_when_there_are_no_marks():
         "\r\n\r\n  spaced  ",
     ):
         assert qwen35.findall(text) == qwen2.findall(text), text
+
+
+# --------------------------------------------------------------------------
+# Text the pre-tokenizer regex does not match must still be encoded.
+#
+# ``_encode_ordinary`` used to call ``findall``, which returns only the matched
+# spans, so any character the regex failed to match was silently dropped from
+# the output - real text loss, not just a different segmentation.  The GPT-2
+# regex genuinely has such gaps: it has no plain ``\s+`` alternative, so the
+# second of two consecutive newlines matches nothing.  Verified against
+# llama.cpp on the real vocabulary: "line one\nline two\n\nline three" is
+# [1056, 825, 198, 1056, 1378, 198, 198, 1056, 2326] and Pyrite now matches.
+# --------------------------------------------------------------------------
+
+
+def _tokenizer_with_pre(pre: str):
+    vocab, merges, token_types, bos, eos = tokenizer_vocab()
+    return GGUFBPETokenizer(
+        vocab, merges, token_types=token_types, bos_id=bos, eos_id=eos, pre=pre
+    )
+
+
+def test_characters_the_pre_tokenizer_does_not_match_are_not_dropped():
+    tok = _tokenizer_with_pre("gpt-2")
+    # The GPT-2 regex matches the first "\n" via \s+(?!\S) and leaves the
+    # second one unmatched.
+    text = "a\n\nb"
+    pieces = pre_tokenizer_for("gpt-2").findall(text)
+    assert "".join(pieces) != text, "premise: this text has an unmatched gap"
+    ids = tok.encode(text)
+    assert tok.decode(ids, skip_special=False) == text
+
+
+def test_gpt2_and_poro_gap_policies_differ_and_both_round_trip():
+    """Gaps are encoded as whole pieces, so merges still apply inside them."""
+    text = "line one\nline two\n\nline three"
+    for pre in ("gpt-2", "poro-chat"):
+        tok = _tokenizer_with_pre(pre)
+        assert tok.decode(tok.encode(text), skip_special=False) == text, pre
+
+
+def test_no_pre_tokenizer_pattern_captures():
+    """``findall``/``finditer`` grouping would corrupt every split.
+
+    A pattern containing a capturing group makes ``findall`` return group
+    tuples instead of whole matches.  The reference spells the GPT-4o
+    lookaheads as ``((?=[\\p{L}])([^a-z]))``; they are transcribed here as
+    ``(?:(?=[\\p{L}])[^a-z])`` for exactly this reason.
+    """
+    import re as _re
+
+    from pyrite.tokenizer import PRE_TOKENIZER_PATTERNS, _expand_unicode_properties
+
+    for name, pattern in PRE_TOKENIZER_PATTERNS.items():
+        expanded = _re.compile(_expand_unicode_properties(pattern))
+        assert expanded.groups == 0, f"{name} has {expanded.groups} capturing group(s)"
+
+
+def test_unicode_property_expansion_handles_multi_letter_categories():
+    """``\\p{Lu}`` and friends, not just single-letter ``\\p{L}``.
+
+    Checked behaviourally: the rendered class is a wall of ``\\uXXXX`` escapes
+    whose *text* contains plenty of ordinary letters, so substring tests on it
+    are meaningless.
+    """
+    import re as _re
+
+    from pyrite.tokenizer import _expand_unicode_properties
+
+    upper = _re.compile(_expand_unicode_properties(r"\p{Lu}"))
+    letters = _re.compile(_expand_unicode_properties(r"\p{L}"))
+    assert upper.fullmatch("A") and not upper.fullmatch("a")
+    assert letters.fullmatch("A") and letters.fullmatch("a")
+    # Marks are their own category, disjoint from letters.
+    marks = _re.compile(_expand_unicode_properties(r"\p{M}"))
+    assert marks.fullmatch("\u0301") and not marks.fullmatch("A")
+
+
+def test_non_bpe_pre_tokenizers_are_refused_with_the_real_reason():
+    """Refusals name the specific upstream flag, not a generic message."""
+    from pyrite.tokenizer import NON_BPE_PRE_TOKENIZERS
+
+    for pre, reason in NON_BPE_PRE_TOKENIZERS.items():
+        with pytest.raises(UnsupportedPreTokenizer) as excinfo:
+            pre_tokenizer_for(pre)
+        message = str(excinfo.value)
+        assert "not byte-level BPE" in message, pre
+        assert reason[:24] in message, pre
+
+
+def test_newly_implemented_pre_tokenizers_are_registered():
+    from pyrite.tokenizer import PRE_TOKENIZER_PATTERNS
+
+    for pre in (
+        "qwen35", "gpt-4o", "llama4", "kanana2", "talkie",
+        "mellum", "modern-bert", "jina-v5-nano",
+    ):
+        assert pre in PRE_TOKENIZER_PATTERNS, pre
+        assert pre_tokenizer_for(pre) is not None

@@ -81,6 +81,40 @@ _LLAMA_BPE_PATTERN = (
 _GPT2_PATTERN = (
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)"
 )
+# llama.cpp: LLAMA_VOCAB_PRE_TYPE_GPT4O / MINIMAX_M2 (llama-vocab.cpp:438).
+# The ``\p{Lu}``-heavy spelling above it in that file is a *comment* quoting the
+# original tokenizer.json; the literal actually compiled uses only \p{L}/\p{N}
+# plus lookaheads, which is why this is reproducible at all.
+#
+# The reference writes its lookaheads as ``((?=[\p{L}])([^a-z]))``.  The capture
+# groups are rewritten as ``(?:(?=[\p{L}])[^a-z])`` because this module splits
+# with ``findall``, which returns *group tuples* rather than whole matches for
+# any pattern containing a capturing group - see
+# ``test_no_pre_tokenizer_pattern_captures``.
+_GPT4O_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?(?:(?=[\p{L}])[^a-z])*(?:(?=[\p{L}])[^A-Z])+"
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"|[^\r\n\p{L}\p{N}]?(?:(?=[\p{L}])[^a-z])+(?:(?=[\p{L}])[^A-Z])*"
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+# llama.cpp: LLAMA_VOCAB_PRE_TYPE_TEKKEN - the same case-splitting lookaheads
+# without the contraction suffix, and digits one at a time.
+_TEKKEN_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?(?:(?=[\p{L}])[^a-z])*(?:(?=[\p{L}])[^A-Z])+"
+    r"|[^\r\n\p{L}\p{N}]?(?:(?=[\p{L}])[^a-z])+(?:(?=[\p{L}])[^A-Z])*"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+_GEMMA4_PATTERN = r"[^\n]+|[\n]+"  # llama.cpp: LLAMA_VOCAB_PRE_TYPE_GEMMA4
+_WHITESPACE_PATTERN = r"\S+"  # llama.cpp: LLAMA_VOCAB_PRE_TYPE_WHITESPACE
 _PORO_PATTERN = r" ?[^\(\s|.,!?…。，、।۔،)]+"  # noqa: RUF001 - these code points are in the reference regex
 
 #: ``tokenizer.ggml.pre`` value -> single-regex pre-tokenizer.
@@ -88,6 +122,16 @@ PRE_TOKENIZER_PATTERNS: dict[str, str] = {
     # llama.cpp: LLAMA_VOCAB_PRE_TYPE_QWEN2 / STABLELM2 / HUNYUAN / SOLAR_OPEN
     "qwen2": _QWEN2_PATTERN,
     "qwen35": _QWEN35_PATTERN,
+    # llama.cpp: LLAMA_VOCAB_PRE_TYPE_GPT4O also backs llama4, kanana2, talkie.
+    "gpt-4o": _GPT4O_PATTERN,
+    "llama4": _GPT4O_PATTERN,
+    "kanana2": _GPT4O_PATTERN,
+    "talkie": _GPT4O_PATTERN,
+    # llama.cpp: LLAMA_VOCAB_PRE_TYPE_GPT2 also backs mellum and modern-bert.
+    "mellum": _GPT2_PATTERN,
+    "modern-bert": _GPT2_PATTERN,
+    # llama.cpp: LLAMA_VOCAB_PRE_TYPE_LLAMA3 also backs jina-v5-nano.
+    "jina-v5-nano": _LLAMA_BPE_PATTERN,
     "deepseek-r1-qwen": _QWEN2_PATTERN,
     "kormo": _QWEN2_PATTERN,
     "f2llmv2": _QWEN2_PATTERN,
@@ -122,11 +166,39 @@ PRE_TOKENIZER_PATTERNS: dict[str, str] = {
 #: ``tokenizer.ggml.pre`` values whose llama.cpp pre-tokenizer is a *list* of
 #: regexes applied in sequence.  A joined alternation is not equivalent, so
 #: Pyrite refuses them rather than emitting plausible-looking wrong ids.
+#: ``pre`` values whose regex Pyrite could transcribe but whose *surrounding*
+#: algorithm differs from byte-level BPE, so a correct-looking regex would still
+#: produce wrong ids.  Each carries the specific reason, read off
+#: ``src/llama-vocab.cpp`` rather than guessed.
+NON_BPE_PRE_TOKENIZERS: dict[str, str] = {
+    "tekken": (
+        "sets ignore_merges=true, so a pre-token piece that exists verbatim in "
+        "the vocabulary is emitted directly instead of being BPE-merged, and "
+        "add_bos=true, which prepends a token Pyrite does not add"
+    ),
+    "gemma4": (
+        "uses SPM-style normalization (spaces become U+2581 before BPE) with "
+        "byte_encode=false, i.e. raw UTF-8 rather than GPT-2 byte encoding"
+    ),
+    "granite-embed-multi-311m": (
+        "uses the GEMMA4 path: SPM-style normalization with byte_encode=false"
+    ),
+    "granite-embed-multi-97m": (
+        "sets ignore_merges=true, so whole pieces bypass BPE merging"
+    ),
+    "whitespace": (
+        "discards the text its \\S+ regex leaves unmatched: measured on a real "
+        "vocabulary, llama.cpp tokenizes 'line one\\nline two' to "
+        "[1056, 603, 1056, 19789] while encoding the unmatched whitespace "
+        "gives [1056, 220, 603, 198, ...]. The reason is not established, so "
+        "Pyrite refuses rather than guess"
+    ),
+}
+
 MULTI_PATTERN_PRE_TOKENIZERS: frozenset[str] = frozenset(
     {
         "chameleon", "deepseek-coder", "deepseek-llm", "falcon", "minicpm5",
-        "default", "whitespace", "tekken", "gpt-4o", "llama4",
-        "gemma4", "mellum", "mellum2", "modern-bert", "jina-v5-nano",
+        "default", "mellum2",
     }
 )
 
@@ -192,13 +264,16 @@ def _expand_unicode_properties(pattern: str) -> str:
     while index < length:
         char = pattern[index]
         if char == "\\":
-            token = pattern[index: index + 5]
-            if len(token) == 5 and token.startswith("\\p{") and token.endswith("}"):
-                letter = token[3]
-                ranges = _unicode_ranges(letter)
-                out.append(ranges if in_class else "[" + ranges + "]")
-                index += 5
-                continue
+            if pattern.startswith("\\p{", index):
+                close = pattern.find("}", index)
+                category = pattern[index + 3: close] if close != -1 else ""
+                if category:
+                    # ``_unicode_ranges`` matches by category prefix, so both
+                    # ``\\p{L}`` (Lu|Ll|Lt|Lm|Lo) and ``\\p{Lu}`` work.
+                    ranges = _unicode_ranges(category)
+                    out.append(ranges if in_class else "[" + ranges + "]")
+                    index = close + 1
+                    continue
             out.append(pattern[index: index + 2])
             index += 2
             continue
@@ -219,6 +294,13 @@ def pre_tokenizer_for(pre: str) -> re.Pattern[str]:
     cached = _COMPILED_PRE_TOKENIZERS.get(pre)
     if cached is not None:
         return cached
+    if pre in NON_BPE_PRE_TOKENIZERS:
+        raise UnsupportedPreTokenizer(
+            f"tokenizer.ggml.pre={pre!r} is not byte-level BPE: it "
+            f"{NON_BPE_PRE_TOKENIZERS[pre]}. Pyrite's tokenizer applies GPT-2 "
+            "byte encoding and BPE merges, so it would emit plausible-looking "
+            "but wrong ids; refusing instead"
+        )
     if pre in MULTI_PATTERN_PRE_TOKENIZERS:
         raise UnsupportedPreTokenizer(
             f"tokenizer.ggml.pre={pre!r} uses a multi-regex pre-tokenizer that Pyrite "
@@ -402,15 +484,43 @@ class GGUFBPETokenizer:
         return result
 
     def _encode_ordinary(self, text: str) -> list[int]:
+        """Encode text the pre-tokenizer regex covers, *and* the text it does not.
+
+        ``findall`` returns only the matched spans, so any character the
+        pre-tokenizer does not match would be silently dropped - losing input.
+        The GPT-2 regex really does have gaps: it has no plain ``\\s+``
+        alternative, so a lone newline before a letter matches nothing, and
+        llama.cpp encodes that newline (token 198) rather than discarding it.
+        The spans between matches are therefore encoded too - as a single piece
+        each, so BPE merges still apply inside them.  That detail is
+        observable: for the poro/bloom regex (which excludes whitespace
+        entirely) the gap ``"\\n\\n"`` encodes to the single merged token 271,
+        while the GPT-2 regex matches the first of two newlines via
+        ``\\s+(?!\\S)`` and leaves the second as a one-character gap that
+        encodes to 198.  Both agree with llama.cpp only with whole-piece gaps.
+        """
         result: list[int] = []
-        for piece in self.pre_tokenizer.findall(text):
-            symbols = [_BYTE_ENCODER[byte] for byte in piece.encode("utf-8")]
-            for symbol in self._apply_merges(symbols):
-                token_id = self._lookup(symbol)
-                if token_id is None:
-                    result.extend(self._byte_fallback(symbol))
-                else:
-                    result.append(token_id)
+        position = 0
+        for match in self.pre_tokenizer.finditer(text):
+            if match.start() > position:
+                result.extend(self._encode_piece(text[position: match.start()]))
+            result.extend(self._encode_piece(match.group(0)))
+            position = match.end()
+        if position < len(text):
+            result.extend(self._encode_piece(text[position:]))
+        return result
+
+
+
+    def _encode_piece(self, piece: str) -> list[int]:
+        result: list[int] = []
+        symbols = [_BYTE_ENCODER[byte] for byte in piece.encode("utf-8")]
+        for symbol in self._apply_merges(symbols):
+            token_id = self._lookup(symbol)
+            if token_id is None:
+                result.extend(self._byte_fallback(symbol))
+            else:
+                result.append(token_id)
         return result
 
     def _apply_merges(self, symbols: list[str]) -> list[str]:
