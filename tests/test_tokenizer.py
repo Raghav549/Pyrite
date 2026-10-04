@@ -1,6 +1,8 @@
 """Byte-level BPE tokenizer behaviour, on a real merge table."""
 from __future__ import annotations
 
+import re as _re
+
 import pytest
 
 from pyrite.tokenizer import (
@@ -324,3 +326,67 @@ def test_newly_implemented_pre_tokenizers_are_registered():
     ):
         assert pre in PRE_TOKENIZER_PATTERNS, pre
         assert pre_tokenizer_for(pre) is not None
+
+
+# --------------------------------------------------------------------------
+# Multi-regex pre-tokenizers: each regex splits the fragments the previous
+# pass produced, and the spans between matches are kept.  Transcribed from the
+# regex_exprs initializers in src/llama-vocab.cpp and cross-checked against
+# llama-tokenize 8/8 each (validation/pretokenizer-audit-crosscheck.txt).
+# --------------------------------------------------------------------------
+
+
+def test_multi_regex_pre_tokenizers_are_implemented_not_refused():
+    from pyrite.tokenizer import MULTI_PATTERN_PRE_TOKENIZERS, PRE_TOKENIZER_SEQUENCES
+
+    for pre in (
+        "falcon", "mellum2", "minicpm5",
+        "deepseek-coder", "deepseek-llm", "chameleon",
+    ):
+        assert pre in PRE_TOKENIZER_SEQUENCES, pre
+        assert pre not in MULTI_PATTERN_PRE_TOKENIZERS, pre
+    # 'default' is the only value left in the multi-regex refusal category.
+    assert set(MULTI_PATTERN_PRE_TOKENIZERS) == {"default"}
+
+
+def test_each_regex_in_a_sequence_splits_the_previous_pass():
+    """The observable consequence of applying regexes in order.
+
+    falcon's third regex is ``[0-9][0-9][0-9]``, so after the GPT-2 pass has
+    produced the run "12345" it is re-split into groups of three.  GPT-2 alone
+    leaves it whole, and mellum2 (whose *first* regex is ``\\p{N}``) splits it
+    into single digits.  All three differ, which only holds if the passes run
+    in sequence over the previous output.
+    """
+    from pyrite.tokenizer import pre_tokenize
+
+    assert pre_tokenize("gpt-2", "12345") == ["12345"]
+    assert pre_tokenize("falcon", "12345") == ["123", "45"]
+    assert pre_tokenize("mellum2", "12345") == ["1", "2", "3", "4", "5"]
+
+
+def test_multi_regex_splitting_keeps_unmatched_spans():
+    """A split, never a filter - same invariant as the single-regex path."""
+    from pyrite.tokenizer import pre_tokenize
+
+    for pre in ("falcon", "mellum2", "minicpm5", "deepseek-coder", "chameleon"):
+        text = "Hello, world! 12345 abc"
+        assert "".join(pre_tokenize(pre, text)) == text, pre
+
+
+def test_multi_regex_pre_tokenizer_round_trips_through_the_tokenizer():
+    tok = _tokenizer_with_pre("falcon")
+    text = "line one\nline two\n\nline three"
+    assert tok.decode(tok.encode(text), skip_special=False) == text
+
+
+def test_sequence_literals_match_the_reference_exactly():
+    """Guard the transcription: these were regenerated from llama.cpp's source,
+    not retyped, after a hand-copy truncated a 223-character literal and
+    produced an invalid ``Ὗ-ώ`` range."""
+    from pyrite.tokenizer import PRE_TOKENIZER_SEQUENCES, _expand_unicode_properties
+
+    for pre, exprs in PRE_TOKENIZER_SEQUENCES.items():
+        assert len(exprs) >= 2, f"{pre} is not multi-regex"
+        for expr in exprs:
+            _re.compile(_expand_unicode_properties(expr))  # must not raise

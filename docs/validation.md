@@ -59,10 +59,10 @@ cmake --build build -j2 --target llama-tokenize llama-completion
 
 ```
 $ python3 -m pytest -q
-359 passed in 57.26s
+364 passed in 62.27s
 ```
 
-The baseline before this round of work was **249 passed**; 110 tests were added.
+The baseline before this round of work was **249 passed**; 115 tests were added.
 Three consecutive full runs gave 353/353/353 - the suite is deterministic, which
 it previously was not. The shipped resident budget (4096 MiB - 768 MiB reserve
 = 3328 MiB) is compared against *currently available* RAM by the PHASE 7 gate,
@@ -400,6 +400,28 @@ Cross-checked against `llama-tokenize` on the real 151,936-token vocabulary,
 a BOS the comparison is made without it; Pyrite adds BOS from
 `tokenizer.ggml.add_bos_token` instead of from the pre-type.
 
+### The multi-regex category was implementable after all
+
+The refusal message said these "apply a *sequence* of regexes" as though that
+were out of reach. It is not: `unicode_regex_split` runs each regex over the
+fragments the previous pass produced, keeping the spans between matches - the
+same split semantics as the single-regex path. `pre_tokenize()` now does that,
+so all six are implemented: `falcon` (3 regexes), `mellum2` (2), `minicpm5`
+(2), `deepseek-coder` (5), `deepseek-llm` (6) and `chameleon` (6). The
+sequence is observable: `falcon`'s third regex `[0-9][0-9][0-9]` re-splits the
+run `"12345"` into `["123", "45"]` after the GPT-2 pass, while `mellum2` -
+whose *first* regex is `\p{N}` - yields five single digits.
+
+The literals were **generated from llama.cpp's source, not retyped**, after a
+hand-copy truncated a 223-character letter-range literal and produced an
+invalid `Ὗ-ώ` range that `re.compile` rejected.
+`test_sequence_literals_match_the_reference_exactly` guards the transcription.
+
+The audit now covers **26 pre-tokenizers, 208/208 identical** to
+`llama-tokenize`. `default` is the only value still refused as multi-regex:
+llama.cpp defines no `regex_exprs` for it, so what it is supposed to do was
+never established here, and guessing is what this file exists to avoid.
+
 ## A real bug the audit exposed: unmatched characters were dropped
 
 `_encode_ordinary` split with `findall`, which returns only the spans the
@@ -431,13 +453,15 @@ are all the whitespace, and llama.cpp discards them (`[1056, 603, 1056,
 
 ## Known limitations
 
-- **Two categories of pre-tokenizer are refused, each with its real reason.**
-  `chameleon`, `deepseek-coder`, `deepseek-llm`, `falcon`, `mellum2`,
-  `minicpm5` and `default` apply a *sequence* of regexes. Separately, `tekken`,
+- **The only remaining pre-tokenizer refusals are for causes that are real.**
+  `default` is refused as multi-regex (llama.cpp has no `regex_exprs` for it at
+  all, so its intended behaviour was never established here). `tekken`,
   `gemma4`, `granite-embed-multi-311m`, `granite-embed-multi-97m` and
-  `whitespace` are not byte-level BPE at all - see the audit below. Both raise
-  `UnsupportedPreTokenizer`. Supported: 34 `pre` values across the qwen2,
-  qwen35, gpt-4o, llama3/llama-bpe, gpt-2 and poro/bloom families.
+  `whitespace` are refused because they are not byte-level BPE - see the audit
+  below. Both raise `UnsupportedPreTokenizer`. Everything else is supported:
+  40 `pre` values across the qwen2, qwen35, gpt-4o, llama3/llama-bpe, gpt-2,
+  poro/bloom, falcon, chameleon, deepseek-coder, deepseek-llm, mellum2 and
+  minicpm5 families.
 - **A GGUF with no `tokenizer.ggml.pre` is refused.** llama.cpp throws for an
   unknown pre-tokenizer for the same reason.
 - **`_apply_merges` is O(n^2)** in the number of symbols in a piece
@@ -510,7 +534,7 @@ python3 scripts/build_vocab_fixture.py --vocab-gguf models/ggml-vocab-qwen2.gguf
 | `validation/generation-qwen3-vocab.json` | Pyrite generation on the real-vocab Qwen3 fixture. |
 | `validation/quantized-crosscheck.txt` | Q8_0 / Q4_0 greedy generation vs llama.cpp: 4/4 identical. |
 | `validation/qwen35-pretokenizer-crosscheck.txt` | qwen35 pre-tokenizer vs llama.cpp: 9/9 identical. |
-| `validation/pretokenizer-audit-crosscheck.txt` | All 20 supported pre-tokenizers vs llama.cpp: 160/160 identical. |
+| `validation/pretokenizer-audit-crosscheck.txt` | All 26 supported pre-tokenizers vs llama.cpp: 208/208 identical. |
 | `validation/pyrite-generation.txt` | Pyrite's completion text. |
 | `validation/llama-cpp-generation.txt` | llama.cpp's completion text, same prompt. |
 | `validation/benchmark-qwen3-0p6b-shape.txt` | The benchmark above. |

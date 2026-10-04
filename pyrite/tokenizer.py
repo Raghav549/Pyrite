@@ -166,6 +166,64 @@ PRE_TOKENIZER_PATTERNS: dict[str, str] = {
 #: ``tokenizer.ggml.pre`` values whose llama.cpp pre-tokenizer is a *list* of
 #: regexes applied in sequence.  A joined alternation is not equivalent, so
 #: Pyrite refuses them rather than emitting plausible-looking wrong ids.
+# ---------------------------------------------------------------------------
+# Multi-regex pre-tokenizers.  llama.cpp applies these *in sequence*: each
+# regex splits every fragment the previous pass produced, and the text between
+# matches is kept, exactly as for the single-regex case.  Transcribed from the
+# ``regex_exprs`` initializers in ``src/llama-vocab.cpp``.
+# ---------------------------------------------------------------------------
+_DEEPSEEK_CODER_SEQUENCE = (
+    '[\r\n]',
+    '\\s?\\p{L}+',
+    '\\s?\\p{P}+',
+    '[一-龥ࠀ-一가-\ud7ff]+',
+    '\\p{N}',
+)
+
+_DEEPSEEK_LLM_SEQUENCE = (
+    '[\r\n]',
+    '\\s?[A-Za-zµÀ-ÖØ-öø-ƺƼ-ƿǄ-ʓʕ-ʯͰ-ͳͶͷͻ-ͽͿΆΈ-ΊΌΎ-ΡΣ-ϵϷ-ҁҊ-ԯԱ-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙὛὝὟ-ώᾀ-ᾴᾶ-ᾼιῂ-ῄῆ-ῌῐ-ΐῖ-Ίῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤΩℨK-ℭℯ-ℴℹℼ-ℿⅅ-ⅉⅎↃↄⰀ-ⱻⱾ-ⳤⳫ-ⳮⳲⳳꙀ-ꙭꚀ-ꚛꜢ-ꝯꝱ-ꞇꞋ-ꞎꭰ-ꮿﬀ-ﬆﬓ-ﬗＡ-Ｚａ-ｚ𐐀-𐑏𐒰-𐓓𐓘-𐓻𐲀-𐲲𐳀-𐳲𑢠-𑣟𞤀-𞥃]+',  # noqa: RUF001
+    '\\s?[!-/:-~！-／：-～‘-‟\u3000-。]+',  # noqa: RUF001
+    '\\s+$',
+    '[一-龥ࠀ-一가-\ud7ff]+',
+    '\\p{N}+',
+)
+
+_CHAMELEON_SEQUENCE = (
+    '<sentinel:[0-9]+>',
+    '(IMGIMG)((A|B|C|D|E|F|G|H|I){1,4})Z',
+    '([\\t\\n]|    |  )',
+    '\\p{N}',
+    '[\\p{P}!-/:-@\\[-`{-~]',
+    _GPT2_PATTERN,
+)
+
+_FALCON_SEQUENCE = (
+    '[\\p{P}\\$\\+<=>\\^~\\|`]+',
+    _GPT2_PATTERN,
+    '[0-9][0-9][0-9]',
+)
+
+_MELLUM2_SEQUENCE = (
+    '\\p{N}',
+    _GPT2_PATTERN,
+)
+
+_MINICPM5_SEQUENCE = (
+    '\\p{N}{1,3}',
+    "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}+| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+)
+
+#: ``tokenizer.ggml.pre`` value -> ordered regex sequence.
+PRE_TOKENIZER_SEQUENCES: dict[str, tuple[str, ...]] = {
+    "falcon": _FALCON_SEQUENCE,
+    "mellum2": _MELLUM2_SEQUENCE,
+    "minicpm5": _MINICPM5_SEQUENCE,
+    "deepseek-coder": _DEEPSEEK_CODER_SEQUENCE,
+    "deepseek-llm": _DEEPSEEK_LLM_SEQUENCE,
+    "chameleon": _CHAMELEON_SEQUENCE,
+}
+
 #: ``pre`` values whose regex Pyrite could transcribe but whose *surrounding*
 #: algorithm differs from byte-level BPE, so a correct-looking regex would still
 #: produce wrong ids.  Each carries the specific reason, read off
@@ -197,8 +255,7 @@ NON_BPE_PRE_TOKENIZERS: dict[str, str] = {
 
 MULTI_PATTERN_PRE_TOKENIZERS: frozenset[str] = frozenset(
     {
-        "chameleon", "deepseek-coder", "deepseek-llm", "falcon", "minicpm5",
-        "default", "mellum2",
+        "default",
     }
 )
 
@@ -289,8 +346,61 @@ def _expand_unicode_properties(pattern: str) -> str:
 _COMPILED_PRE_TOKENIZERS: dict[str, re.Pattern[str]] = {}
 
 
+_COMPILED_SEQUENCES: dict[str, tuple[re.Pattern[str], ...]] = {}
+
+
+def _compiled_sequence(pre: str) -> tuple[re.Pattern[str], ...]:
+    cached = _COMPILED_SEQUENCES.get(pre)
+    if cached is None:
+        cached = tuple(
+            re.compile(_expand_unicode_properties(expr))
+            for expr in PRE_TOKENIZER_SEQUENCES[pre]
+        )
+        _COMPILED_SEQUENCES[pre] = cached
+    return cached
+
+
+def _split_with(pattern: re.Pattern[str], text: str) -> list[str]:
+    """Split ``text`` on ``pattern``, keeping the spans between matches.
+
+    A split, never a filter: dropping the unmatched spans would silently lose
+    input, which is the bug ``test_characters_the_pre_tokenizer_does_not_match
+    _are_not_dropped`` guards against.
+    """
+    pieces: list[str] = []
+    position = 0
+    for match in pattern.finditer(text):
+        if match.start() > position:
+            pieces.append(text[position: match.start()])
+        pieces.append(match.group(0))
+        position = match.end()
+    if position < len(text):
+        pieces.append(text[position:])
+    return pieces
+
+
+def pre_tokenize(pre: str, text: str) -> list[str]:
+    """Pre-tokenize ``text`` for a ``tokenizer.ggml.pre`` value.
+
+    Single-regex values are one pass; multi-regex values apply each regex in
+    turn to the fragments the previous pass produced, which is what
+    ``unicode_regex_split`` does in llama.cpp.
+    """
+    if not text:
+        return []
+    if pre in PRE_TOKENIZER_SEQUENCES:
+        fragments = [text]
+        for pattern in _compiled_sequence(pre):
+            fragments = [piece for fragment in fragments for piece in _split_with(pattern, fragment)]
+        return fragments
+    return _split_with(pre_tokenizer_for(pre), text)
+
+
 def pre_tokenizer_for(pre: str) -> re.Pattern[str]:
-    """Compiled pre-tokenizer for a ``tokenizer.ggml.pre`` value."""
+    """Compiled pre-tokenizer for a single-regex ``tokenizer.ggml.pre`` value.
+
+    Multi-regex values have no single pattern; use :func:`pre_tokenize`.
+    """
     cached = _COMPILED_PRE_TOKENIZERS.get(pre)
     if cached is not None:
         return cached
@@ -399,7 +509,11 @@ class GGUFBPETokenizer:
         self.add_bos = bool(add_bos)
         # Resolved eagerly so an unsupported pre-tokenizer is reported when the
         # tokenizer is built, not halfway through encoding a prompt.
-        self.pre_tokenizer = pre_tokenizer_for(pre)
+        # Multi-regex pre-tokenizers have no single pattern; the split is done
+        # by pre_tokenize(), which handles both shapes.
+        self.pre_tokenizer = (
+            None if pre in PRE_TOKENIZER_SEQUENCES else pre_tokenizer_for(pre)
+        )
         self._token_to_id: dict[str, int] = {}
         for index, token in enumerate(self.tokens):
             self._token_to_id.setdefault(token, index)
@@ -499,16 +613,11 @@ class GGUFBPETokenizer:
         ``\\s+(?!\\S)`` and leaves the second as a one-character gap that
         encodes to 198.  Both agree with llama.cpp only with whole-piece gaps.
         """
-        result: list[int] = []
-        position = 0
-        for match in self.pre_tokenizer.finditer(text):
-            if match.start() > position:
-                result.extend(self._encode_piece(text[position: match.start()]))
-            result.extend(self._encode_piece(match.group(0)))
-            position = match.end()
-        if position < len(text):
-            result.extend(self._encode_piece(text[position:]))
-        return result
+        return [
+            token_id
+            for piece in pre_tokenize(self.pre, text)
+            for token_id in self._encode_piece(piece)
+        ]
 
 
 
