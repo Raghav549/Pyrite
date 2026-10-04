@@ -50,6 +50,28 @@ def test_special_tokens_are_kept_whole():
     assert tokenizer.decode(ids) == "hi"
 
 
+def test_generated_special_tokens_survive_a_verbatim_decode():
+    """`skip_special` changes the *text*, never the id list.
+
+    This distinction produced a wrong conclusion once: a comparison against
+    llama.cpp used the default `skip_special=True` decode, so a generated
+    USER_DEFINED token vanished from the string and looked like the two runtimes
+    disagreed. They had produced identical ids.
+    """
+    tokenizer = make_test_tokenizer()
+    ids = tokenizer.encode("<|im_start|>hi")
+    special_id = ids[0]
+    assert tokenizer.tokens[special_id] == "<|im_start|>"
+    assert tokenizer._is_special(special_id, tokenizer.tokens[special_id]) is True
+
+    # The id list is the ground truth and is unaffected by the flag.
+    assert special_id in ids
+    assert tokenizer.decode(ids, skip_special=False).startswith("<|im_start|>")
+    assert "<|im_start|>" not in tokenizer.decode(ids, skip_special=True)
+    # Round-tripping the verbatim form must recover every id.
+    assert tokenizer.encode(tokenizer.decode(ids, skip_special=False)) == ids
+
+
 def test_encode_with_bos():
     tokenizer = make_test_tokenizer()
     vocab, _, _, bos, _ = tokenizer_vocab()

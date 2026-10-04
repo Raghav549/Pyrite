@@ -157,8 +157,18 @@ def compare_generation(binary: Path, model: Path, prompt: str, tokens: int) -> d
     runtime = PyriteRuntime(config)
     with open_executor(model, runtime=runtime, sampler_seed=42) as executor:
         result = executor.generate_text(prompt, max_new_tokens=tokens, temperature=0.0)
+        # llama.cpp prints every sampled token, including USER_DEFINED and
+        # CONTROL specials.  Pyrite's generate_text decodes with
+        # skip_special=True (the right default for a user-facing string), so a
+        # comparison that used it would report a difference where the token
+        # sequences are in fact identical.  Decode without skipping.
+        # output_ids includes the prompt; llama.cpp does not echo it.
+        verbatim = executor.tokenizer.decode(
+            result["output_ids"][-result["new_tokens"] :], skip_special=False
+        )
         report["pyrite"] = {
             "completion": result["completion"],
+            "completion_verbatim": verbatim,
             "prompt_tokens": result["prompt_tokens"],
             "new_tokens": result["new_tokens"],
             "output_ids": result["output_ids"][-tokens:],
@@ -213,7 +223,13 @@ def main(argv: list[str] | None = None) -> int:
         print("  llama.cpp output tail:")
         for line in str(reference["stdout_tail"]).splitlines()[-6:]:
             print("   ", line)
-        print("  pyrite:", json.dumps(generation["pyrite"], default=str)[:400])
+        pyrite = generation["pyrite"]
+        print("  pyrite (verbatim):", repr(pyrite["completion_verbatim"])[:200])
+        reference_text = str(reference["stdout_tail"]).strip()
+        print(
+            "  identical to llama.cpp:",
+            pyrite["completion_verbatim"].strip() == reference_text,
+        )
     return 0
 
 

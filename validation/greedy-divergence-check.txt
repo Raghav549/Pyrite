@@ -1,8 +1,9 @@
-qwen3 dense  prompt='Explain Pyrite in one short '   tokens= 48 IDENTICAL=True agreeing_prefix=249/249
-qwen3 dense  prompt='The capital of France is'       tokens= 48 IDENTICAL=True agreeing_prefix=226/226
-qwen3 dense  prompt='def fibonacci(n):\n    '        tokens= 48 IDENTICAL=True agreeing_prefix=237/237
-qwen3moe     prompt='Explain Pyrite in one short '   tokens= 48 IDENTICAL=True agreeing_prefix=236/236
-qwen3moe     prompt='The capital of France is'       tokens= 48 IDENTICAL=True agreeing_prefix=258/258
-qwen3moe     prompt='def fibonacci(n):\n    '        tokens= 48 IDENTICAL=True agreeing_prefix=243/243
+qwen3 dense  prompt='Explain Pyrite in one short '   tokens= 48 IDENTICAL=True
+qwen3 dense  prompt='The capital of France is'       tokens= 48 IDENTICAL=True
+qwen3 dense  prompt='def fibonacci(n):\n    '        tokens= 48 IDENTICAL=True
+qwen3moe     prompt='Explain Pyrite in one short '   tokens= 48 IDENTICAL=True
+qwen3moe     prompt='The capital of France is'       tokens= 48 IDENTICAL=True
+qwen3moe     prompt='def fibonacci(n):\n    '        tokens= 48 IDENTICAL=True
 
 6/6 greedy runs byte-identical over 48 tokens each
+reference runtime: llama.cpp master, built from source this session
