@@ -244,6 +244,15 @@ NON_BPE_PRE_TOKENIZERS: dict[str, str] = {
     "granite-embed-multi-97m": (
         "sets ignore_merges=true, so whole pieces bypass BPE merging"
     ),
+    "default": (
+        "has no regex_exprs in llama.cpp at all - the vector is declared empty "
+        "and the switch has no case LLAMA_VOCAB_PRE_TYPE_DEFAULT - so what it "
+        "should do is undefined. The obvious reading, a no-op split that hands "
+        "the whole text to BPE, was implemented and measured: it matched "
+        "llama-tokenize on only 4 of 8 cases, merging 't where the reference "
+        "does not and \\n\\n where the reference emits two \\n. Refused "
+        "rather than shipped wrong"
+    ),
     "whitespace": (
         "discards the text its \\S+ regex leaves unmatched: measured on a real "
         "vocabulary, llama.cpp tokenizes 'line one\\nline two' to "
@@ -255,7 +264,6 @@ NON_BPE_PRE_TOKENIZERS: dict[str, str] = {
 
 MULTI_PATTERN_PRE_TOKENIZERS: frozenset[str] = frozenset(
     {
-        "default",
     }
 )
 

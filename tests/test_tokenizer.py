@@ -345,8 +345,11 @@ def test_multi_regex_pre_tokenizers_are_implemented_not_refused():
     ):
         assert pre in PRE_TOKENIZER_SEQUENCES, pre
         assert pre not in MULTI_PATTERN_PRE_TOKENIZERS, pre
-    # 'default' is the only value left in the multi-regex refusal category.
-    assert set(MULTI_PATTERN_PRE_TOKENIZERS) == {"default"}
+    # Nothing is refused as multi-regex any more: every sequence llama.cpp
+    # defines has been transcribed.  'default' is refused separately, because
+    # llama.cpp defines no regex_exprs for it at all and the obvious no-op
+    # reading was measured against llama-tokenize at only 4/8.
+    assert not MULTI_PATTERN_PRE_TOKENIZERS
 
 
 def test_each_regex_in_a_sequence_splits_the_previous_pass():

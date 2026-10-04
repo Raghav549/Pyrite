@@ -59,7 +59,7 @@ cmake --build build -j2 --target llama-tokenize llama-completion
 
 ```
 $ python3 -m pytest -q
-364 passed in 62.27s
+364 passed in 59.47s
 ```
 
 The baseline before this round of work was **249 passed**; 115 tests were added.
@@ -418,9 +418,21 @@ invalid `Ὗ-ώ` range that `re.compile` rejected.
 `test_sequence_literals_match_the_reference_exactly` guards the transcription.
 
 The audit now covers **26 pre-tokenizers, 208/208 identical** to
-`llama-tokenize`. `default` is the only value still refused as multi-regex:
-llama.cpp defines no `regex_exprs` for it, so what it is supposed to do was
-never established here, and guessing is what this file exists to avoid.
+`llama-tokenize`, and **nothing is refused as multi-regex any more**.
+
+### `default` was tested, not assumed
+
+`pre=default` was the one value left over. `src/llama-vocab.cpp` declares
+`std::vector<std::string> regex_exprs;` empty and its `switch` has **no**
+`case LLAMA_VOCAB_PRE_TYPE_DEFAULT`, so the obvious reading is that no
+pre-splitting happens and BPE receives the whole text as one fragment.
+
+That hypothesis was implemented and measured rather than shipped: it matched
+`llama-tokenize` on only **4 of 8** cases. Where it disagreed, the reference
+merged less - `don't` came back as `don`, `'`, `t` rather than `don`, `'t`, and
+`"\n\n"` came back as two `\n` (198, 198) rather than the merged 271. So
+`pre=default` does something other than a no-op split, and what it does was not
+established. It is refused, with that measurement in the error message.
 
 ## A real bug the audit exposed: unmatched characters were dropped
 
@@ -453,12 +465,13 @@ are all the whitespace, and llama.cpp discards them (`[1056, 603, 1056,
 
 ## Known limitations
 
-- **The only remaining pre-tokenizer refusals are for causes that are real.**
-  `default` is refused as multi-regex (llama.cpp has no `regex_exprs` for it at
-  all, so its intended behaviour was never established here). `tekken`,
-  `gemma4`, `granite-embed-multi-311m`, `granite-embed-multi-97m` and
-  `whitespace` are refused because they are not byte-level BPE - see the audit
-  below. Both raise `UnsupportedPreTokenizer`. Everything else is supported:
+- **Six pre-tokenizers are refused, each for a stated and checked reason.**
+  `default` (llama.cpp defines no `regex_exprs` for it; the no-op reading was
+  implemented and measured at 4/8), `tekken` (`ignore_merges=true`),
+  `gemma4` and `granite-embed-multi-311m` (SPM-style normalization,
+  `byte_encode=false`), `granite-embed-multi-97m` (`ignore_merges=true`) and
+  `whitespace` (discards its unmatched spans, unexplained by any flag). All
+  raise `UnsupportedPreTokenizer`. Everything else is supported:
   40 `pre` values across the qwen2, qwen35, gpt-4o, llama3/llama-bpe, gpt-2,
   poro/bloom, falcon, chameleon, deepseek-coder, deepseek-llm, mellum2 and
   minicpm5 families.

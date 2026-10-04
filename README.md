@@ -87,9 +87,9 @@ Unicode property classes (`\p{L}`, `\p{N}`, `\p{P}`, `\p{M}`, `\p{S}`) are
 expanded from `unicodedata`, not approximated by Python's `\w`/`\d`.
 
 Pre-tokenizers that llama.cpp implements as a *sequence* of regexes
-(`default`) raise `UnsupportedPreTokenizer` rather than emit plausible-looking
-but wrong token ids, as do the pre-tokenizers that are not byte-level BPE at
-all (`tekken` sets `ignore_merges=true`; `gemma4` uses SPM-style normalization
+(`default`, whose no-op reading was implemented and measured at only 4/8
+against `llama-tokenize`) raise `UnsupportedPreTokenizer` rather than emit
+plausible-looking but wrong token ids, as do those that are not byte-level BPE (`tekken` sets `ignore_merges=true`; `gemma4` uses SPM-style normalization
 with `byte_encode=false`). Multi-regex pre-tokenizers *are* supported -
 `falcon`, `chameleon`, `deepseek-coder`, `deepseek-llm`, `mellum2` and
 `minicpm5` apply their regexes in sequence, as llama.cpp does. Every supported
