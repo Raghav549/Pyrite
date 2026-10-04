@@ -201,6 +201,61 @@ def q8_1_vector(data: bytes, count: int) -> list[float]:
     return out
 
 
+#: ``kvalues_iq4nl`` from ``ggml-quants.c``: the 4-bit non-linear code book.
+KVALUES_IQ4NL: tuple[int, ...] = (
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+)
+
+
+def iq4_nl_vector(data: bytes, count: int) -> list[float]:
+    """IQ4_NL: Q4_0 geometry with the non-linear 4-bit code book."""
+    if count % 32:
+        raise ValueError("IQ4_NL count must be divisible by 32")
+    _require(data, (count // 32) * 18, "IQ4_NL")
+    out: list[float] = []
+    pos = 0
+    for _ in range(count // 32):
+        scale = _half(data, pos)
+        block = data[pos + 2: pos + 18]
+        pos += 18
+        out.extend(scale * KVALUES_IQ4NL[byte & 0x0F] for byte in block)
+        out.extend(scale * KVALUES_IQ4NL[byte >> 4] for byte in block)
+    return out
+
+
+def iq4_xs_vector(data: bytes, count: int) -> list[float]:
+    """IQ4_XS super-blocks (256 values, 136 bytes).
+
+    Layout is ``d`` (half), ``scales_h`` (u16), ``scales_l[4]``, ``qs[128]``;
+    this mirrors ``dequantize_row_iq4_xs`` in ``ggml-quants.c``, including the
+    ``ls - 32`` sub-block scale offset and the low/high nibble split at 16.
+    """
+    if count % 256:
+        raise ValueError("IQ4_XS count must be divisible by 256")
+    _require(data, (count // 256) * 136, "IQ4_XS")
+    out: list[float] = []
+    pos = 0
+    for _ in range(count // 256):
+        scale = _half(data, pos)
+        scales_h = struct.unpack_from("<H", data, pos + 2)[0]
+        scales_l = data[pos + 4: pos + 8]
+        quants = data[pos + 8: pos + 136]
+        pos += 136
+        for sub in range(8):
+            ls = ((scales_l[sub // 2] >> (4 * (sub % 2))) & 0x0F) | (
+                ((scales_h >> (2 * sub)) & 3) << 4
+            )
+            delta = scale * (ls - 32)
+            base = sub * 16
+            block = [0.0] * 32
+            for index in range(16):
+                byte = quants[base + index]
+                block[index] = delta * KVALUES_IQ4NL[byte & 0x0F]
+                block[index + 16] = delta * KVALUES_IQ4NL[byte >> 4]
+            out.extend(block)
+    return out
+
+
 def _get_scale_min_k4(j: int, scales: bytes) -> tuple[int, int]:
     """Mirror of ``get_scale_min_k4`` from ``ggml-quants.c``."""
     if j < 4:
@@ -409,6 +464,8 @@ DECODABLE_TYPES: dict[int, Callable[[bytes, int], list[float]]] = {
     12: q4_k_vector,
     13: q5_k_vector,
     14: q6_k_vector,
+    20: iq4_nl_vector,
+    23: iq4_xs_vector,
     24: i8_vector,
     25: i16_vector,
     26: i32_vector,

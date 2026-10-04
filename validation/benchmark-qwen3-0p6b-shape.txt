@@ -1,0 +1,20 @@
+MODEL               : /home/user/models/qwen3-0p6b-shape.gguf
+model_bytes         : 1411753984
+layers/hidden/vocab : 28 1024 271
+lm_head             : output.weight [1024, 271] F32
+prompt_tokens       : 38
+open_seconds        : 0.420
+first_token_seconds : 1.421  (cold: first full pass over 28 layers)
+prefill_rest_seconds: 46.347  for 37 remaining prompt tokens (0.80 tok/s)
+decode_seconds      : 8.762  for 6 tokens
+decode_tokens_per_s : 0.685
+peak_rss_mb         : 1374.2
+kv_tokens/kv_bytes  : 44 5046272
+context_reached     : 44 of 512
+native_calls        : 8800
+native_bytes        : 62057611264
+native_seconds      : 47.831
+io_seconds          : 1.692
+bytes_loaded        : 1410721792
+evictions           : 0  cache_hits: 8582
+cpu                 : 2 cores, no GPU (CUDA/Metal unavailable)

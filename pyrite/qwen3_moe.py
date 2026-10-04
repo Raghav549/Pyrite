@@ -24,6 +24,15 @@ from pathlib import Path
 from .adapters.gguf import GGUFReader, GGUFTensor
 from .ggml_types import row_size, type_name
 from .ggml_types import spec as ggml_spec
+from .lm_head import (
+    LMHead,
+    LMHeadContractError,
+    Vocabulary,
+    VocabularyContractError,
+    declared_tied_embeddings,
+    resolve_lm_head,
+    resolve_vocabulary,
+)
 from .tensor_ops import DECODABLE_TYPES
 
 ARCHITECTURE = "qwen3moe"
@@ -101,6 +110,15 @@ class Qwen3MoEConfig:
     norm_topk_prob: bool
     tie_word_embeddings: bool
     expert_weights_scale: float
+    #: Vocabulary entries the tokenizer can name (``vocab_size`` may be padded).
+    vocab_token_count: int = 0
+    vocab_source: str = "unknown"
+    #: ``True`` when the file itself declared tying; ``None`` means undeclared.
+    tie_declared: bool | None = None
+
+    def __post_init__(self) -> None:
+        if not self.vocab_token_count:
+            object.__setattr__(self, "vocab_token_count", self.vocab_size)
 
     @property
     def q_proj_dim(self) -> int:
@@ -127,7 +145,11 @@ class Qwen3MoEConfig:
         return max(1, self.num_attention_heads // max(1, self.num_key_value_heads))
 
     @classmethod
-    def from_metadata(cls, metadata: Mapping[str, object]) -> Qwen3MoEConfig:
+    def from_metadata(
+        cls,
+        metadata: Mapping[str, object],
+        tensors: Mapping[str, GGUFTensor] | None = None,
+    ) -> Qwen3MoEConfig:
         def get(key: str, default: object = None) -> object:
             return metadata.get(key, default)
 
@@ -147,7 +169,16 @@ class Qwen3MoEConfig:
         moe_intermediate = int(n("expert_feed_forward_length", 0) or 0)
         experts = int(n("expert_count", 0) or 0)
         per_tok = int(n("expert_used_count", 0) or 0)
-        vocab = _resolve_vocab_size(metadata, n)
+        embedding = (tensors or {}).get("token_embd.weight")
+        embedding_rows = (
+            int(embedding.dims[1])
+            if embedding is not None and len(embedding.dims) == 2
+            else None
+        )
+        try:
+            vocab = resolve_vocabulary(metadata, ARCHITECTURE, embedding_rows)
+        except VocabularyContractError as exc:
+            raise Qwen3MoEContractError(str(exc)) from exc
         raw_head_dim = n("attention.key_length", None)
         head_dim = int(hidden // heads if raw_head_dim is None and heads else raw_head_dim or 0)
         raw_value_dim = n("attention.value_length", None)
@@ -159,16 +190,32 @@ class Qwen3MoEConfig:
         rope_theta = float(1_000_000.0 if raw_rope_theta is None else raw_rope_theta)
         bos = get("tokenizer.ggml.bos_token_id")
         eos = get("tokenizer.ggml.eos_token_id")
-        tied = _metadata_bool(n("tied_word_embeddings"), False, "tied_word_embeddings")
+        declared_tied = _declared_tied(metadata)
         norm_topk = _metadata_bool(n("expert_weights_norm"), True, "expert_weights_norm")
         raw_expert_scale = n("expert_weights_scale", None)
         expert_scale = float(1.0 if raw_expert_scale is None else raw_expert_scale)
 
-        required = (hidden, layers, heads, kv_heads, intermediate, moe_intermediate, experts, per_tok, vocab, head_dim)
-        if any(value <= 0 for value in required):
-            raise Qwen3MoEContractError("GGUF is missing required Qwen3-MoE metadata")
+        required = {
+            "embedding_length": hidden,
+            "block_count": layers,
+            "attention.head_count": heads,
+            "attention.head_count_kv": kv_heads,
+            "feed_forward_length": intermediate,
+            "expert_feed_forward_length": moe_intermediate,
+            "expert_count": experts,
+            "expert_used_count": per_tok,
+            "attention.key_length": head_dim,
+        }
+        missing = sorted(name for name, value in required.items() if value <= 0)
+        if missing:
+            raise Qwen3MoEContractError(
+                "GGUF is missing required Qwen3-MoE metadata: "
+                + ", ".join(f"{ARCHITECTURE}.{name}" for name in missing)
+            )
         if kv_heads > heads or heads % kv_heads:
-            raise Qwen3MoEContractError("attention head count must be divisible by KV head count")
+            raise Qwen3MoEContractError(
+                f"attention head count {heads} must be divisible by KV head count {kv_heads}"
+            )
         if per_tok > experts:
             raise Qwen3MoEContractError("expert_used_count cannot exceed expert_count")
         if value_dim <= 0 or not math.isfinite(eps) or eps <= 0:
@@ -187,7 +234,7 @@ class Qwen3MoEConfig:
             num_key_value_heads=kv_heads,
             num_experts=experts,
             num_experts_per_tok=per_tok,
-            vocab_size=vocab,
+            vocab_size=vocab.size,
             head_dim=head_dim,
             value_dim=value_dim,
             rms_norm_eps=eps,
@@ -196,8 +243,13 @@ class Qwen3MoEConfig:
             bos_token_id=int(bos) if bos is not None else None,
             eos_token_id=int(eos) if eos is not None else None,
             norm_topk_prob=norm_topk,
-            tie_word_embeddings=tied,
+            # As for the dense executor: an undeclared tie is decided by whether
+            # output.weight exists, which validate_contract() resolves.
+            tie_word_embeddings=bool(declared_tied) if declared_tied is not None else False,
             expert_weights_scale=expert_scale,
+            vocab_token_count=vocab.token_count,
+            vocab_source=vocab.source,
+            tie_declared=declared_tied,
         )
 
     @property
@@ -213,6 +265,18 @@ class Qwen3MoEConfig:
         return dict(self.__dict__)
 
 
+def _declared_tied(metadata: Mapping[str, object]) -> bool | None:
+    """Read an explicit tie declaration; ``None`` when the file makes none.
+
+    The reference runtime has no ``tied_word_embeddings`` GGUF key at all, so an
+    absent flag is normal and must not be read as "not tied".
+    """
+    try:
+        return declared_tied_embeddings(metadata, ARCHITECTURE)
+    except LMHeadContractError as exc:
+        raise Qwen3MoEContractError(str(exc)) from exc
+
+
 def _metadata_bool(value: object, default: bool, name: str) -> bool:
     if value is None:
         return default
@@ -223,34 +287,18 @@ def _metadata_bool(value: object, default: bool, name: str) -> bool:
     raise Qwen3MoEContractError(f"{name} metadata must be a boolean")
 
 
-def _resolve_vocab_size(metadata: Mapping[str, object], get_key) -> int:
-    """Resolve the vocabulary size the way real GGUFs store it.
+def _resolve_vocab_size(metadata: Mapping[str, object], get_key=None) -> int:
+    """Metadata-only vocabulary width (kept for callers without a tensor index).
 
-    ``tokenizer.ggml.vocab_size`` is not part of the published GGUF contract;
-    files carry the token array and/or ``{arch}.vocab_size``.  Prefer the
-    explicit key, then the token array length, then the legacy key.
-
-    When both the explicit key and a token array are present they must agree:
-    llama.cpp derives the vocabulary from the tokenizer and refuses files
-    where the embedding table disagrees, so Pyrite refuses them too instead of
-    generating undecodable token ids.
+    Real GGUF files carry no ``{arch}.vocab_size`` key: the converter pads
+    ``tokenizer.ggml.tokens`` up to the HuggingFace vocabulary size, so the
+    token array length is the authoritative value.  See
+    :func:`pyrite.lm_head.resolve_vocabulary`.
     """
-    explicit = metadata.get(f"{ARCHITECTURE}.vocab_size")
-    tokens = metadata.get("tokenizer.ggml.tokens")
-    token_count = len(tokens) if isinstance(tokens, (list, tuple)) and tokens else 0
-    if explicit is not None:
-        if token_count and int(explicit) != token_count:
-            raise Qwen3MoEContractError(
-                f"{ARCHITECTURE}.vocab_size is {int(explicit)} but the tokenizer "
-                f"carries {token_count} tokens; refusing a self-inconsistent checkpoint"
-            )
-        return int(explicit)
-    if token_count:
-        return token_count
-    legacy = metadata.get("tokenizer.ggml.vocab_size")
-    if legacy is not None:
-        return int(legacy)
-    return 0
+    try:
+        return resolve_vocabulary(metadata, ARCHITECTURE, None).size
+    except VocabularyContractError as exc:
+        raise Qwen3MoEContractError(str(exc)) from exc
 
 
 class Qwen3MoECheckpoint:
@@ -262,8 +310,34 @@ class Qwen3MoECheckpoint:
         if self.reader.path != self.path:
             raise ValueError("GGUF reader belongs to a different checkpoint")
         self.metadata = self.reader.metadata()
-        self.config = Qwen3MoEConfig.from_metadata(self.metadata)
         self._tensors = {tensor.name: tensor for tensor in self.reader.tensor_index()}
+        self.config = Qwen3MoEConfig.from_metadata(self.metadata, self._tensors)
+        self._lm_head: LMHead | None = None
+
+    @property
+    def lm_head(self) -> LMHead:
+        """The tensor used as the LM output projection (resolved and validated)."""
+        if self._lm_head is None:
+            self._lm_head = resolve_lm_head(
+                self._tensors,
+                self.metadata,
+                ARCHITECTURE,
+                self.config.hidden_size,
+                Vocabulary(
+                    self.config.vocab_size,
+                    self.config.vocab_token_count,
+                    self.config.vocab_source,
+                ),
+                # Decodability is deliberately not checked here: ensure_decodable()
+                # is the single gate that refuses to run on undecodable tensors, and
+                # qwen3-check must be able to *report* them instead of aborting.
+                decodable=None,
+            )
+        return self._lm_head
+
+    @property
+    def lm_head_tensor(self) -> str:
+        return self.lm_head.tensor_name
 
     @property
     def tensor_count(self) -> int:
@@ -339,10 +413,10 @@ class Qwen3MoECheckpoint:
 
         require("token_embd.weight", (cfg.hidden_size, cfg.vocab_size))
         require("output_norm.weight", (cfg.hidden_size,))
+        # output.weight is optional: a checkpoint without it ties the LM head to
+        # token_embd.weight, exactly as llama.cpp's qwen3moe loader does.
         if "output.weight" in self._tensors:
             require("output.weight", (cfg.hidden_size, cfg.vocab_size))
-        elif not cfg.tie_word_embeddings:
-            problems.append("missing tensor: output.weight (checkpoint does not declare tied embeddings)")
 
         for layer in range(cfg.num_hidden_layers):
             prefix = f"blk.{layer}."
@@ -372,7 +446,21 @@ class Qwen3MoECheckpoint:
             raise Qwen3MoEContractError(
                 "Qwen3-MoE GGUF contract violated:\n  - " + "\n  - ".join(problems[:20])
             )
-        return self.routing_summary()
+        try:
+            # Resolving the LM head is the check: it raises when neither an
+            # untied output projection nor a legally tied embedding exists.
+            lm_head = self.lm_head
+            assert lm_head.tensor_name, "resolve_lm_head must name a tensor"
+        except LMHeadContractError as exc:
+            raise Qwen3MoEContractError(
+                f"Qwen3-MoE GGUF contract violated:\n  - {exc}"
+            ) from exc
+        summary = self.routing_summary()
+        summary["vocab_size"] = cfg.vocab_size
+        summary["vocab_token_count"] = cfg.vocab_token_count
+        summary["vocab_source"] = cfg.vocab_source
+        summary["lm_head"] = self.lm_head.to_dict()
+        return summary
 
     def routing_summary(self) -> dict[str, object]:
         cfg = self.config
@@ -399,9 +487,10 @@ class Qwen3MoECheckpoint:
             complete_layers += int(
                 all(f"{prefix}{name}" in self._tensors for name in layer_requirements)
             )
-        output_complete = (
-            "output.weight" in self._tensors or cfg.tie_word_embeddings
-        )
+        try:
+            output_complete = self.lm_head is not None
+        except LMHeadContractError:
+            output_complete = False
         globals_complete = (
             "token_embd.weight" in self._tensors
             and "output_norm.weight" in self._tensors

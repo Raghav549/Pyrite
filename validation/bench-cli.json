@@ -1,0 +1,34 @@
+{
+  "benchmark": "policy",
+  "machine": {
+    "os": "Linux-6.1.158+-x86_64-with-glibc2.36",
+    "system": "Linux",
+    "machine": "x86_64",
+    "python": "3.11.2",
+    "cpu_count": 2,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+    "total_ram_mb": 3939.89453125
+  },
+  "route": {
+    "name": "coding",
+    "confidence": 0.72,
+    "preferred_blocks": [
+      "shared:coding",
+      "shared:general"
+    ]
+  },
+  "plans": 16,
+  "elapsed_s": 0.0005784850000054576,
+  "process_rss_before_mb": 19.93359375,
+  "process_rss_after_mb": 19.93359375,
+  "status": {
+    "ram_budget_mb": 4096,
+    "working_set_mb": 3328,
+    "process_rss_mb": 19.93359375,
+    "resident_blocks": 0,
+    "resident_bytes": 0,
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "offline": true
+  }
+}

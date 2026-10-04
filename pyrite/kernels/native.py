@@ -1,4 +1,4 @@
-"""Optional portable C kernels for Q4_K and Q6_K GGML matrices.
+"""Optional portable C kernels for GGML matrices.
 
 Pyrite compiles a tiny dependency-free shared library to the system temporary
 cache on first use when a C compiler is present.  The library has a plain C
@@ -6,6 +6,12 @@ ABI (it does not require Python headers); compiler-less installs transparently
 use the bounded Python reference implementation.  The checkpoint buffer is
 borrowed through CPython's buffer protocol, so the native path does not copy or
 expand quantized weights.
+
+The kernels cover the plain (F32/F16/BF16/F64/I8-I64) and the most common
+quantized layouts, including Q8_0 - the quantization used by the published
+Qwen3 Q8_0 checkpoints.  ``NATIVE_TYPES`` mirrors the ``PYRITE_TYPES`` table in
+``native.c`` and ``tests/test_native_kernels.py`` asserts the two agree, and
+that every native decoder matches the Python reference decoder bit for bit.
 """
 from __future__ import annotations
 
@@ -21,7 +27,30 @@ from array import array
 from collections.abc import Sequence
 from pathlib import Path
 
-NATIVE_TYPES = frozenset({12, 14})
+#: GGML type ids with a native kernel.  Must match PYRITE_TYPES in native.c.
+NATIVE_TYPES = frozenset({
+    0,   # F32
+    1,   # F16
+    2,   # Q4_0
+    3,   # Q4_1
+    6,   # Q5_0
+    7,   # Q5_1
+    8,   # Q8_0
+    9,   # Q8_1
+    10,  # Q2_K
+    11,  # Q3_K
+    12,  # Q4_K
+    13,  # Q5_K
+    14,  # Q6_K
+    20,  # IQ4_NL
+    23,  # IQ4_XS
+    24,  # I8
+    25,  # I16
+    26,  # I32
+    27,  # I64
+    28,  # F64
+    30,  # BF16
+})
 _LIBRARY: ctypes.CDLL | None = None
 _LIBRARY_ATTEMPTED = False
 
@@ -114,6 +143,18 @@ def _load_library() -> ctypes.CDLL | None:
             ctypes.c_size_t,
         )
         lib.pyrite_dequantize_rows.restype = ctypes.c_int
+        lib.pyrite_native_types.argtypes = (ctypes.POINTER(ctypes.c_int), ctypes.c_size_t)
+        lib.pyrite_native_types.restype = ctypes.c_int
+        count = lib.pyrite_native_types(None, 0)
+        if count > 0:
+            buffer = (ctypes.c_int * count)()
+            written = lib.pyrite_native_types(buffer, count)
+            reported = frozenset(buffer[i] for i in range(max(0, written)))
+            # The C table is the source of truth; a mismatch means the two
+            # halves of the kernel drifted apart, which would silently send
+            # unsupported layouts down the native path.
+            if reported != NATIVE_TYPES:
+                return None
         _LIBRARY = lib
     except (OSError, subprocess.SubprocessError, AttributeError):
         _LIBRARY = None
@@ -126,6 +167,26 @@ def native_available() -> bool:
 
 def supports_native(ggml_type: int) -> bool:
     return ggml_type in NATIVE_TYPES and native_available()
+
+
+def native_type_ids() -> tuple[int, ...]:
+    """GGML type ids the loaded native library really implements."""
+    lib = _load_library()
+    if lib is None:
+        return ()
+    count = lib.pyrite_native_types(None, 0)
+    if count <= 0:
+        return ()
+    buffer = (ctypes.c_int * count)()
+    written = lib.pyrite_native_types(buffer, count)
+    return tuple(buffer[i] for i in range(max(0, written)))
+
+
+def sorted_native_types() -> list[str]:
+    """Display names of the natively accelerated GGML types (empty if none)."""
+    from ..ggml_types import type_name
+
+    return [type_name(type_id) for type_id in sorted(native_type_ids())]
 
 
 def _with_buffer(payload, callback):

@@ -1,0 +1,9 @@
+qwen3 dense  prompt='Explain Pyrite in one short '   tokens= 48 IDENTICAL=True
+qwen3 dense  prompt='The capital of France is'       tokens= 48 IDENTICAL=True
+qwen3 dense  prompt='def fibonacci(n):\n    '        tokens= 48 IDENTICAL=True
+qwen3moe     prompt='Explain Pyrite in one short '   tokens= 48 IDENTICAL=True
+qwen3moe     prompt='The capital of France is'       tokens= 48 IDENTICAL=True
+qwen3moe     prompt='def fibonacci(n):\n    '        tokens= 48 IDENTICAL=True
+
+6/6 greedy runs byte-identical over 48 tokens each
+reference runtime: llama.cpp master, built from source this session

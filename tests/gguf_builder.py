@@ -78,6 +78,8 @@ class GGUFFileBuilder:
         self.alignment = alignment
         self.metadata: list[tuple[str, bytes]] = []
         self.tensors: list[tuple[str, tuple[int, ...], int, bytes]] = []
+        #: Tensors whose payload is produced on demand by :meth:`write_streaming`.
+        self.deferred: list[tuple[str, tuple[int, ...], int, object, int]] = []
         self.add("general.architecture", architecture)
         self.add("general.alignment", alignment)
 
@@ -108,6 +110,69 @@ class GGUFFileBuilder:
             )
         self.tensors.append((name, tuple(int(d) for d in dims), ggml_type, payload))
         return self
+
+    # ---------------------------------------------------------------- deferred
+    def add_tensor_lazy(
+        self,
+        name: str,
+        dims: tuple[int, ...],
+        ggml_type: int,
+        producer,
+    ) -> GGUFFileBuilder:
+        """Register a tensor whose payload is produced only when writing.
+
+        ``to_bytes`` holds every payload in memory at once, which is fine for
+        test fixtures but cannot build a multi-gigabyte checkpoint.  A lazy
+        tensor keeps only its shape until :meth:`write_streaming` asks for the
+        bytes, so peak memory stays at one tensor.
+        """
+        elements = math.prod(int(d) for d in dims) if dims else 1
+        expected = tensor_size(elements, ggml_type)
+        self.deferred.append((name, tuple(int(d) for d in dims), ggml_type, producer, expected))
+        return self
+
+    def write_streaming(self, path: Path) -> Path:
+        """Write the checkpoint with bounded memory, one tensor at a time."""
+        path = Path(path)
+        total = len(self.tensors) + len(self.deferred)
+        meta = b"".join(_encode_string(key) + raw for key, raw in self.metadata)
+        header = b"GGUF" + struct.pack("<IQQ", 3, total, len(self.metadata))
+
+        entries = [(name, dims, ggml_type, payload, len(payload)) for name, dims, ggml_type, payload in self.tensors]
+        entries += [
+            (name, dims, ggml_type, producer, expected) for name, dims, ggml_type, producer, expected in self.deferred
+        ]
+
+        directory = bytearray()
+        offset = 0
+        offsets: list[int] = []
+        for name, dims, ggml_type, _payload, size in entries:
+            offsets.append(offset)
+            directory += _encode_string(name)
+            directory += struct.pack("<I", len(dims))
+            directory += b"".join(struct.pack("<Q", dim) for dim in dims)
+            directory += struct.pack("<IQ", ggml_type, offset)
+            offset += size
+            offset += (-offset) % self.alignment
+
+        prefix = bytearray(header + meta + bytes(directory))
+        while len(prefix) % self.alignment:
+            prefix.append(0)
+
+        with path.open("wb") as handle:
+            handle.write(bytes(prefix))
+            for (name, _dims, _ggml_type, payload, size), tensor_offset in zip(entries, offsets, strict=True):
+                pad = (len(prefix) + tensor_offset) - handle.tell()
+                if pad > 0:
+                    handle.write(b"\x00" * pad)
+                data = payload() if callable(payload) else payload
+                if len(data) != size:
+                    raise ValueError(f"tensor {name}: produced {len(data)} bytes, expected {size}")
+                handle.write(data)
+            tail = (-handle.tell()) % self.alignment
+            if tail:
+                handle.write(b"\x00" * tail)
+        return path
 
     # ------------------------------------------------------------------- write
     def to_bytes(self) -> bytes:

@@ -32,15 +32,30 @@ class GGUFTensor:
 
     @property
     def element_count(self) -> int:
+        # GGML fills the unused dimensions with 1, so a zero-dimension
+        # (scalar) tensor still holds exactly one element.
         total = 1
         for dim in self.dims:
             total *= dim
-        return total if self.dims else 0
+        return total
+
+
+class GGUFError(ValueError):
+    """A GGUF file that cannot be parsed safely.
+
+    Every message names the offending field so a corrupt or hostile file is
+    reported precisely instead of being read past its end.
+    """
 
 
 class _Reader:
-    def __init__(self, fh):
+    def __init__(self, fh, limit: int):
         self.fh = fh
+        self.limit = limit
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.limit - self.fh.tell())
 
     def u8(self) -> int: return struct.unpack("<B", self._read(1))[0]
     def i8(self) -> int: return struct.unpack("<b", self._read(1))[0]
@@ -56,20 +71,33 @@ class _Reader:
     def raw(self, size: int) -> bytes:
         return self._read(size)
 
-    def string(self) -> str:
+    def string(self, label: str = "string") -> str:
         size = self.u64()
-        if size > 1024 * 1024:
-            raise ValueError("GGUF string exceeds safety limit")
+        if size > self.remaining:
+            raise GGUFError(
+                f"GGUF {label} claims {size} bytes but only {self.remaining} remain in the file"
+            )
+        if size > self.MAX_STRING_BYTES:
+            raise GGUFError(
+                f"GGUF {label} length {size} exceeds the {self.MAX_STRING_BYTES}-byte safety limit"
+            )
         raw = self._read(size)
         try:
             return raw.decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise ValueError("invalid UTF-8 string in GGUF") from exc
+            raise GGUFError(f"invalid UTF-8 in GGUF {label}") from exc
+
+    MAX_STRING_BYTES = 4 * 1024 * 1024
 
     def _read(self, size: int) -> bytes:
+        if size < 0:
+            raise GGUFError(f"negative GGUF read of {size} bytes")
         data = self.fh.read(size)
         if len(data) != size:
-            raise ValueError("truncated GGUF checkpoint")
+            raise GGUFError(
+                f"truncated GGUF checkpoint: wanted {size} bytes at offset "
+                f"{self.fh.tell() - len(data)}, got {len(data)}"
+            )
         return data
 
 
@@ -77,7 +105,17 @@ class GGUFReader:
     """Bounds-checked reader for GGUF v1-v3 checkpoints."""
 
     MAGIC = b"GGUF"
+    #: ``GGUF_DEFAULT_ALIGNMENT`` from ``ggml/include/gguf.h``.
     DEFAULT_ALIGNMENT = 32
+    #: ``GGML_MAX_DIMS`` from ``ggml/include/ggml.h``.
+    MAX_DIMS = 4
+    #: ``GGML_MAX_NAME`` from ``ggml/include/ggml.h``; llama.cpp rejects longer.
+    MAX_NAME = 64
+    #: GGUFv1 used 32-bit counts and string lengths.  The reference
+    #: implementation dropped it ("GGUFv1 is no longer supported"), and reading
+    #: a real v1 file with 64-bit widths would misparse it, so Pyrite refuses it.
+    MIN_VERSION = 2
+    MAX_VERSION = 3
     MAX_TENSORS = 10_000_000
     MAX_METADATA = 1_000_000
     MAX_ARRAY = 100_000_000
@@ -176,41 +214,63 @@ class GGUFReader:
 
         size = self.path.stat().st_size
         with self.path.open("rb") as fh:
-            r = _Reader(fh)
+            r = _Reader(fh, size)
             if r.raw(4) != self.MAGIC:
-                raise ValueError("not a GGUF checkpoint")
+                raise GGUFError(f"not a GGUF checkpoint: bad magic in {self.path.name}")
             version = r.u32()
-            if version < 1 or version > 3:
-                raise ValueError(f"unsupported GGUF version: {version}")
+            if version < self.MIN_VERSION:
+                raise GGUFError(
+                    f"unsupported GGUF version {version}: GGUFv1 used 32-bit counts and is "
+                    "no longer supported by the reference implementation; re-export as v3"
+                )
+            if version > self.MAX_VERSION:
+                raise GGUFError(
+                    f"unsupported GGUF version {version}: Pyrite reads v{self.MIN_VERSION}"
+                    f"-v{self.MAX_VERSION}"
+                )
             tensor_count, metadata_count = r.u64(), r.u64()
             if tensor_count > self.MAX_TENSORS or metadata_count > self.MAX_METADATA:
-                raise ValueError("GGUF counts exceed safety limits")
+                raise GGUFError(
+                    f"GGUF header declares {tensor_count} tensors and {metadata_count} "
+                    f"metadata entries; the safety limits are {self.MAX_TENSORS} and "
+                    f"{self.MAX_METADATA}, so the file is corrupt or truncated"
+                )
 
             metadata: dict[str, Any] = {}
             alignment = self.DEFAULT_ALIGNMENT
             for _ in range(metadata_count):
-                key, value_type = r.string(), r.u32()
+                key, value_type = r.string("metadata key"), r.u32()
                 if key in metadata:
-                    raise ValueError(f"duplicate GGUF metadata key: {key}")
-                value = self._read_value(r, value_type)
+                    raise GGUFError(f"duplicate GGUF metadata key: {key}")
+                value = self._read_value(r, value_type, key)
                 metadata[key] = value
                 if key == "general.alignment":
                     if not isinstance(value, int) or value <= 0 or value & (value - 1):
-                        raise ValueError(f"invalid GGUF alignment: {value!r}")
+                        raise GGUFError(
+                            f"invalid GGUF alignment {value!r}: must be a positive power of two"
+                        )
                     alignment = value
 
             descriptors: list[tuple[str, tuple[int, ...], int, int]] = []
             seen: set[str] = set()
             for _ in range(tensor_count):
-                name, n_dims = r.string(), r.u32()
+                name, n_dims = r.string("tensor name"), r.u32()
                 if name in seen:
-                    raise ValueError(f"duplicate GGUF tensor name: {name}")
+                    raise GGUFError(f"duplicate GGUF tensor name: {name}")
+                if len(name) >= self.MAX_NAME:
+                    raise GGUFError(
+                        f"tensor name {name[:32]!r}... is {len(name)} bytes; GGML_MAX_NAME is "
+                        f"{self.MAX_NAME}"
+                    )
                 seen.add(name)
-                if n_dims == 0 or n_dims > 8:
-                    raise ValueError(f"GGUF tensor {name!r} has invalid dimension count: {n_dims}")
+                if n_dims > self.MAX_DIMS:
+                    raise GGUFError(
+                        f"GGUF tensor {name!r} has {n_dims} dimensions; GGML_MAX_DIMS is "
+                        f"{self.MAX_DIMS}"
+                    )
                 dims = tuple(r.u64() for _ in range(n_dims))
                 if any(dim == 0 for dim in dims):
-                    raise ValueError(f"GGUF tensor {name!r} has a zero-sized dimension")
+                    raise GGUFError(f"GGUF tensor {name!r} has a zero-sized dimension: {dims}")
                 descriptors.append((name, dims, r.u32(), r.u64()))
 
             position = fh.tell()
@@ -220,24 +280,39 @@ class GGUFReader:
                 else position
             )
             if data_offset > size:
-                raise ValueError("GGUF tensor data starts beyond end of file")
+                raise GGUFError(
+                    f"GGUF tensor data starts at {data_offset}, beyond the {size}-byte file"
+                )
             tensors: list[GGUFTensor] = []
             extents: list[tuple[int, int, str]] = []
             for name, dims, ggml_type, relative_offset in descriptors:
                 if relative_offset % alignment:
-                    raise ValueError(f"unaligned GGUF tensor offset: {name}")
-                tensor_bytes = self._tensor_size(dims, ggml_type, name)
+                    raise GGUFError(
+                        f"unaligned GGUF tensor offset: {name} starts at {relative_offset}, "
+                        f"which is not a multiple of the {alignment}-byte alignment"
+                    )
+                try:
+                    tensor_bytes = self._tensor_size(dims, ggml_type, name)
+                except ValueError as exc:
+                    raise GGUFError(str(exc)) from exc
+                if relative_offset > size - data_offset:
+                    raise GGUFError(
+                        f"GGUF tensor {name} offset {relative_offset} lies beyond the file"
+                    )
                 absolute = data_offset + relative_offset
+                if tensor_bytes > size - absolute:
+                    raise GGUFError(
+                        f"GGUF tensor {name} needs {tensor_bytes} bytes at {absolute} but the "
+                        f"file ends at {size}"
+                    )
                 end = absolute + tensor_bytes
-                if end > size:
-                    raise ValueError(f"GGUF tensor extends beyond file: {name}")
                 tensors.append(GGUFTensor(name, dims, ggml_type, absolute, tensor_bytes))
                 extents.append((absolute, end, name))
             previous_end = data_offset
             previous_name = ""
             for start, end, name in sorted(extents):
                 if start < previous_end:
-                    raise ValueError(
+                    raise GGUFError(
                         f"GGUF tensor payload overlaps another tensor: {previous_name}, {name}"
                     )
                 previous_end = end
@@ -250,7 +325,7 @@ class GGUFReader:
         self._size = size
         self._parsed = True
 
-    def _read_value(self, r: _Reader, value_type: int) -> Any:
+    def _read_value(self, r: _Reader, value_type: int, key: str = "value") -> Any:
         if value_type == self.TYPE_UINT8: return r.u8()
         if value_type == self.TYPE_INT8: return r.i8()
         if value_type == self.TYPE_UINT16: return r.u16()
@@ -263,21 +338,35 @@ class GGUFReader:
             if value not in (0, 1):
                 raise ValueError(f"invalid GGUF boolean value: {value}")
             return bool(value)
-        if value_type == self.TYPE_STRING: return r.string()
+        if value_type == self.TYPE_STRING: return r.string(f"metadata value for {key!r}")
         if value_type == self.TYPE_ARRAY:
             element_type, count = r.u32(), r.u64()
             if count > self.MAX_ARRAY:
-                raise ValueError("GGUF metadata array exceeds safety limit")
-            return tuple(self._read_value(r, element_type) for _ in range(count))
+                raise GGUFError(
+                    f"GGUF metadata array {key!r} declares {count} elements, above the "
+                    f"{self.MAX_ARRAY} safety limit"
+                )
+            # A count larger than the remaining bytes cannot be backed by real
+            # data; refuse it up front rather than allocating millions of
+            # Python objects for a hostile or truncated file.
+            if count > r.remaining:
+                raise GGUFError(
+                    f"GGUF metadata array {key!r} declares {count} elements but only "
+                    f"{r.remaining} bytes remain in the file"
+                )
+            return tuple(self._read_value(r, element_type, key) for _ in range(count))
         if value_type == self.TYPE_UINT64: return r.u64()
         if value_type == self.TYPE_INT64: return r.i64()
         if value_type == self.TYPE_FLOAT64: return r.f64()
-        raise ValueError(f"unsupported GGUF metadata type: {value_type}")
+        raise GGUFError(
+            f"unsupported GGUF metadata value type {value_type} for key {key!r}"
+        )
 
     @staticmethod
     def _tensor_size(dims: tuple[int, ...], ggml_type: int, name: str = "") -> int:
         if not dims:
-            raise ValueError("GGUF tensor must have at least one dimension")
+            # A zero-dimension tensor is a scalar in GGML; one element.
+            return row_size(1, ggml_type)
         if any(dim <= 0 for dim in dims):
             raise ValueError("GGUF tensor dimensions must be positive")
         rows = 1

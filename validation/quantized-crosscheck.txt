@@ -1,0 +1,8 @@
+Q8_0: lm_head output.weight [64, 151936] Q8_0
+  prompt='Explain Pyrite in one short '   tokens= 32 IDENTICAL=True
+  prompt='The capital of France is'       tokens= 32 IDENTICAL=True
+Q4_0: lm_head output.weight [64, 151936] Q4_0
+  prompt='Explain Pyrite in one short '   tokens= 32 IDENTICAL=True
+  prompt='The capital of France is'       tokens= 32 IDENTICAL=True
+
+4/4 quantized greedy runs byte-identical over 32 tokens each

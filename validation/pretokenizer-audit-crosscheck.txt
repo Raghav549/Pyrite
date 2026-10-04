@@ -1,0 +1,36 @@
+Pre-tokenizer audit: Pyrite vs llama.cpp master, real 151,936-token Qwen2 vocab
+8 cases per pre-tokenizer
+
+--- MULTI-REGEX (newly implemented) ---
+falcon             8/8 IDENTICAL
+mellum2            8/8 IDENTICAL
+minicpm5           8/8 IDENTICAL
+deepseek-coder     8/8 IDENTICAL
+deepseek-llm       8/8 IDENTICAL
+chameleon          8/8 IDENTICAL  [llama prepends BOS]
+
+--- SINGLE-REGEX (newly implemented) ---
+gpt-4o             8/8 IDENTICAL
+llama4             8/8 IDENTICAL
+kanana2            8/8 IDENTICAL
+talkie             8/8 IDENTICAL
+mellum             8/8 IDENTICAL
+modern-bert        8/8 IDENTICAL
+jina-v5-nano       8/8 IDENTICAL  [llama prepends BOS]
+
+--- REGRESSION (previously supported) ---
+qwen2              8/8 IDENTICAL
+qwen35             8/8 IDENTICAL
+llama3             8/8 IDENTICAL  [llama prepends BOS]
+llama-bpe          8/8 IDENTICAL  [llama prepends BOS]
+gpt-2              8/8 IDENTICAL
+poro-chat          8/8 IDENTICAL
+bloom              8/8 IDENTICAL
+hunyuan            8/8 IDENTICAL
+solar-open         8/8 IDENTICAL
+deepseek-r1-qwen   8/8 IDENTICAL
+kormo              8/8 IDENTICAL
+f2llmv2            8/8 IDENTICAL
+stablelm2          8/8 IDENTICAL
+
+208/208 total cases identical to llama.cpp

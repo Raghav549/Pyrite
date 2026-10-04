@@ -123,6 +123,53 @@ static double dot_q6_k(const uint8_t *block, const double *x) {
     return sum;
 }
 
+/* block_q3_K is 110 bytes for 256 values: hmask[32] | qs[64] | scales[12] |
+ * d (half).  The 12 scale bytes hold sixteen 6-bit values; the packing undone
+ * here is the one ggml-quants.c applies when quantizing. */
+static void decode_q3_k(const uint8_t *block, double *out) {
+    const uint8_t *hmask = block;
+    const uint8_t *quants = block + 32;
+    const double d = (double)fp16_to_float(read_le16(block + 108));
+
+    uint32_t aux[4] = {0u, 0u, 0u, 0u};
+    memcpy(aux, block + 96, 12);
+    const uint32_t tmp = aux[2];
+    uint32_t packed[4];
+    packed[2] = ((aux[0] >> 4) & 0x0F0F0F0Fu) | (((tmp >> 4) & 0x03030303u) << 4);
+    packed[3] = ((aux[1] >> 4) & 0x0F0F0F0Fu) | (((tmp >> 6) & 0x03030303u) << 4);
+    packed[0] = (aux[0] & 0x0F0F0F0Fu) | (((tmp >> 0) & 0x03030303u) << 4);
+    packed[1] = (aux[1] & 0x0F0F0F0Fu) | (((tmp >> 2) & 0x03030303u) << 4);
+    int8_t scales[16];
+    memcpy(scales, packed, 16);
+
+    int is = 0;
+    int q = 0;
+    int m = 1;
+    for (int outer = 0; outer < 256; outer += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; ++j) {
+            /* Brackets matter: d * ((double)scale - 32.0). */
+            double dl = d * ((double)scales[is] - 32.0);
+            ++is;
+            for (int l = 0; l < 16; ++l) {
+                const int value =
+                    (int)((quants[q + l] >> shift) & 3) - ((hmask[l] & m) ? 0 : 4);
+                out[outer + shift * 16 + l] = dl * (double)value;
+            }
+            dl = d * ((double)scales[is] - 32.0);
+            ++is;
+            for (int l = 0; l < 16; ++l) {
+                const int value =
+                    (int)((quants[q + 16 + l] >> shift) & 3) - ((hmask[16 + l] & m) ? 0 : 4);
+                out[outer + shift * 16 + 16 + l] = dl * (double)value;
+            }
+            shift += 2;
+            m = (m << 1) & 0xFF;
+        }
+        q += 32;
+    }
+}
+
 static void decode_q4_k(const uint8_t *block, double *out) {
     const double d = (double)fp16_to_float(read_le16(block));
     const double dmin = (double)fp16_to_float(read_le16(block + 2));
@@ -177,25 +224,294 @@ static void decode_q6_k(const uint8_t *block, double *out) {
     }
 }
 
+/* ------------------------------------------------------------------ *
+ * Additional decoders, mirroring pyrite/tensor_ops.py (which mirrors
+ * ggml-quants.c).  Every routine here is checked against the Python
+ * reference by tests/test_native_kernels.py, so a layout mistake shows
+ * up as a test failure rather than as a silently wrong model.
+ * ------------------------------------------------------------------ */
+
+typedef void (*decode_block_fn)(const uint8_t *block, double *out);
+
+#define GGML_HALF_BITS 16
+
+static void decode_f32(const uint8_t *block, double *out) {
+    uint32_t bits;
+    memcpy(&bits, block, 4);
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    out[0] = (double)value;
+}
+
+static void decode_f64(const uint8_t *block, double *out) {
+    memcpy(out, block, 8);
+}
+
+static void decode_f16(const uint8_t *block, double *out) {
+    out[0] = (double)fp16_to_float(read_le16(block));
+}
+
+static void decode_bf16(const uint8_t *block, double *out) {
+    uint32_t bits = ((uint32_t)read_le16(block)) << 16;
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    out[0] = (double)value;
+}
+
+static void decode_i8(const uint8_t *block, double *out) { out[0] = (double)(int8_t)block[0]; }
+
+static void decode_i16(const uint8_t *block, double *out) {
+    out[0] = (double)(int16_t)read_le16(block);
+}
+
+static void decode_i32(const uint8_t *block, double *out) {
+    uint32_t bits = (uint32_t)block[0] | ((uint32_t)block[1] << 8) |
+                    ((uint32_t)block[2] << 16) | ((uint32_t)block[3] << 24);
+    out[0] = (double)(int32_t)bits;
+}
+
+static void decode_i64(const uint8_t *block, double *out) {
+    uint64_t bits = 0;
+    for (int i = 7; i >= 0; --i) {
+        bits = (bits << 8) | (uint64_t)block[i];
+    }
+    out[0] = (double)(int64_t)bits;
+}
+
+static void decode_q4_0(const uint8_t *block, double *out) {
+    const double d = (double)fp16_to_float(read_le16(block));
+    const uint8_t *qs = block + 2;
+    for (int i = 0; i < 16; ++i) {
+        out[i] = d * (double)((int)(qs[i] & 0x0f) - 8);
+        out[i + 16] = d * (double)((int)(qs[i] >> 4) - 8);
+    }
+}
+
+static void decode_q4_1(const uint8_t *block, double *out) {
+    const double d = (double)fp16_to_float(read_le16(block));
+    const double m = (double)fp16_to_float(read_le16(block + 2));
+    const uint8_t *qs = block + 4;
+    for (int i = 0; i < 16; ++i) {
+        out[i] = d * (double)(qs[i] & 0x0f) + m;
+        out[i + 16] = d * (double)(qs[i] >> 4) + m;
+    }
+}
+
+static void decode_q5_0(const uint8_t *block, double *out) {
+    const double d = (double)fp16_to_float(read_le16(block));
+    const uint32_t qh = (uint32_t)block[2] | ((uint32_t)block[3] << 8) |
+                        ((uint32_t)block[4] << 16) | ((uint32_t)block[5] << 24);
+    const uint8_t *qs = block + 6;
+    for (int i = 0; i < 16; ++i) {
+        const int low = (int)(qs[i] & 0x0f);
+        const int high = (int)(qs[i] >> 4);
+        /* ggml: xh_0 = ((qh >> i) << 4) & 0x10, xh_1 = (qh >> (i + 12)) & 0x10,
+         * i.e. bit i and bit i+16 of the qh mask; both halves are symmetric
+         * around -16 before scaling. */
+        out[i] = d * ((double)(low | (int)(((qh >> i) & 1u) << 4)) - 16.0);
+        out[i + 16] = d * ((double)(high | (int)(((qh >> (i + 16)) & 1u) << 4)) - 16.0);
+    }
+}
+
+static void decode_q5_1(const uint8_t *block, double *out) {
+    const double d = (double)fp16_to_float(read_le16(block));
+    const double m = (double)fp16_to_float(read_le16(block + 2));
+    const uint32_t qh = (uint32_t)block[4] | ((uint32_t)block[5] << 8) |
+                        ((uint32_t)block[6] << 16) | ((uint32_t)block[7] << 24);
+    const uint8_t *qs = block + 8;
+    for (int i = 0; i < 16; ++i) {
+        const int low = (int)(qs[i] & 0x0f);
+        const int high = (int)(qs[i] >> 4);
+        out[i] = d * (double)(low | (int)(((qh >> i) & 1u) << 4)) + m;
+        out[i + 16] = d * (double)(high | (int)(((qh >> (i + 16)) & 1u) << 4)) + m;
+    }
+}
+
+static void decode_q8_0(const uint8_t *block, double *out) {
+    const double d = (double)fp16_to_float(read_le16(block));
+    const int8_t *qs = (const int8_t *)(block + 2);
+    for (int i = 0; i < 32; ++i) {
+        out[i] = d * (double)qs[i];
+    }
+}
+
+static void decode_q8_1(const uint8_t *block, double *out) {
+    const double d = (double)fp16_to_float(read_le16(block));
+    const int8_t *qs = (const int8_t *)(block + 4);
+    for (int i = 0; i < 32; ++i) {
+        out[i] = d * (double)qs[i];
+    }
+}
+
+/* kvalues_iq4nl from ggml-quants.c: the 4-bit non-linear code book. */
+static const int8_t KVALUES_IQ4NL[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+static void decode_iq4_nl(const uint8_t *block, double *out) {
+    const double d = (double)fp16_to_float(read_le16(block));
+    const uint8_t *qs = block + 2;
+    for (int i = 0; i < 16; ++i) {
+        out[i] = d * (double)KVALUES_IQ4NL[qs[i] & 0x0f];
+        out[i + 16] = d * (double)KVALUES_IQ4NL[qs[i] >> 4];
+    }
+}
+
+/* block_iq4_xs is 136 bytes for 256 values: d (half), scales_h (u16),
+ * scales_l[4], qs[128].  Eight 32-value sub-blocks, each with a 6-bit scale
+ * split across scales_l and scales_h and offset by -32.  Mirrors
+ * dequantize_row_iq4_xs in ggml/src/ggml-quants.c. */
+static void decode_iq4_xs(const uint8_t *block, double *out) {
+    const double d = (double)fp16_to_float(read_le16(block));
+    const unsigned int scales_h = (unsigned int)read_le16(block + 2);
+    const uint8_t *scales_l = block + 4;
+    const uint8_t *qs = block + 8;
+    for (int sub = 0; sub < 8; ++sub) {
+        const int ls = ((int)(scales_l[sub / 2] >> (4 * (sub % 2))) & 0x0f)
+                     | (int)(((scales_h >> (2 * sub)) & 3u) << 4);
+        /* Brackets matter: d * ((double)ls - 32.0), not (d * ls) - 32.0. */
+        const double dl = d * ((double)ls - 32.0);
+        for (int j = 0; j < 16; ++j) {
+            out[sub * 32 + j] = dl * (double)KVALUES_IQ4NL[qs[sub * 16 + j] & 0x0f];
+            out[sub * 32 + j + 16] = dl * (double)KVALUES_IQ4NL[qs[sub * 16 + j] >> 4];
+        }
+    }
+}
+
+static void decode_q2_k(const uint8_t *block, double *out) {
+    const uint8_t *scales = block;
+    const uint8_t *quants = block + 16;
+    const double d = (double)fp16_to_float(read_le16(block + 80));
+    const double dmin = (double)fp16_to_float(read_le16(block + 82));
+    int is = 0;
+    int q = 0;
+    for (int outer = 0; outer < 256; outer += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; ++j) {
+            double dl = d * (double)(scales[is] & 0x0f);
+            double ml = dmin * (double)(scales[is] >> 4);
+            ++is;
+            for (int l = 0; l < 16; ++l) {
+                out[outer + shift * 16 + l] = dl * (double)((quants[q + l] >> shift) & 3) - ml;
+            }
+            dl = d * (double)(scales[is] & 0x0f);
+            ml = dmin * (double)(scales[is] >> 4);
+            ++is;
+            for (int l = 0; l < 16; ++l) {
+                out[outer + shift * 16 + 16 + l] =
+                    dl * (double)((quants[q + 16 + l] >> shift) & 3) - ml;
+            }
+            shift += 2;
+        }
+        q += 32;
+    }
+}
+
+static void decode_q5_k(const uint8_t *block, double *out) {
+    const double d = (double)fp16_to_float(read_le16(block));
+    const double dmin = (double)fp16_to_float(read_le16(block + 2));
+    const uint8_t *scales = block + 4;
+    const uint8_t *qh = block + 16;
+    const uint8_t *ql = block + 48;
+    int is = 0;
+    int q = 0;
+    unsigned int u1 = 1, u2 = 2;
+    for (int outer = 0; outer < 256; outer += 64) {
+        int sc1, m1, sc2, m2;
+        get_scale_min_k4(is + 0, scales, &sc1, &m1);
+        get_scale_min_k4(is + 1, scales, &sc2, &m2);
+        const double d1 = d * (double)sc1;
+        const double min1 = dmin * (double)m1;
+        const double d2 = d * (double)sc2;
+        const double min2 = dmin * (double)m2;
+        for (int l = 0; l < 32; ++l) {
+            out[outer + l] = d1 * (double)((ql[q + l] & 0x0f) + ((qh[l] & u1) ? 16 : 0)) - min1;
+            out[outer + l + 32] =
+                d2 * (double)((ql[q + l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - min2;
+        }
+        q += 32;
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+}
+
+/* --------------------------------------------------------------- *
+ * Type table.  ids and geometry match ggml/include/ggml.h and
+ * ggml/src/ggml-common.h; they are also asserted against
+ * pyrite/ggml_types.py by tests/test_native_kernels.py.
+ * --------------------------------------------------------------- */
+typedef struct {
+    int type_id;
+    size_t block_size;
+    size_t bytes_per_block;
+    decode_block_fn decode;
+} pyrite_type;
+
+static const pyrite_type PYRITE_TYPES[] = {
+    { 0,  1,   4, decode_f32    },
+    { 1,  1,   2, decode_f16    },
+    { 2,  32,  18, decode_q4_0  },
+    { 3,  32,  20, decode_q4_1  },
+    { 6,  32,  22, decode_q5_0  },
+    { 7,  32,  24, decode_q5_1  },
+    { 8,  32,  34, decode_q8_0  },
+    { 9,  32,  36, decode_q8_1  },
+    { 10, 256, 84, decode_q2_k  },
+    { 11, 256, 110, decode_q3_k },
+    { 12, 256, 144, decode_q4_k },
+    { 13, 256, 176, decode_q5_k },
+    { 14, 256, 210, decode_q6_k },
+    { 20, 32,  18, decode_iq4_nl },
+    { 23, 256, 136, decode_iq4_xs },
+    { 24, 1,   1, decode_i8     },
+    { 25, 1,   2, decode_i16    },
+    { 26, 1,   4, decode_i32    },
+    { 27, 1,   8, decode_i64    },
+    { 28, 1,   8, decode_f64    },
+    { 30, 1,   2, decode_bf16   },
+};
+
+static const pyrite_type *lookup_type(int type_id) {
+    for (size_t i = 0; i < sizeof(PYRITE_TYPES) / sizeof(PYRITE_TYPES[0]); ++i) {
+        if (PYRITE_TYPES[i].type_id == type_id) {
+            return &PYRITE_TYPES[i];
+        }
+    }
+    return NULL;
+}
+
+int pyrite_native_types(int *ids, size_t capacity) {
+    const size_t count = sizeof(PYRITE_TYPES) / sizeof(PYRITE_TYPES[0]);
+    if (ids == NULL) {
+        return (int)count;
+    }
+    const size_t n = count < capacity ? count : capacity;
+    for (size_t i = 0; i < n; ++i) {
+        ids[i] = PYRITE_TYPES[i].type_id;
+    }
+    return (int)n;
+}
+
 static int matrix_geometry(int type_id, size_t rows, size_t cols, size_t *row_bytes,
-                           size_t *expected_bytes) {
-    size_t block_bytes;
-    if (type_id == 12) {
-        block_bytes = Q4K_BYTES;
-    } else if (type_id == 14) {
-        block_bytes = Q6K_BYTES;
-    } else {
+                           size_t *expected_bytes, const pyrite_type **type_out) {
+    const pyrite_type *type = lookup_type(type_id);
+    if (type == NULL || type->decode == NULL) {
         return -1;
     }
-    if (rows == 0 || cols == 0 || cols % QK_K != 0 ||
-        cols / QK_K > SIZE_MAX / block_bytes) {
+    if (rows == 0 || cols == 0 || type->block_size == 0 ||
+        cols % type->block_size != 0 ||
+        cols / type->block_size > SIZE_MAX / type->bytes_per_block) {
         return -2;
     }
-    *row_bytes = (cols / QK_K) * block_bytes;
+    *row_bytes = (cols / type->block_size) * type->bytes_per_block;
     if (*row_bytes > SIZE_MAX / rows) {
         return -2;
     }
     *expected_bytes = *row_bytes * rows;
+    if (type_out != NULL) {
+        *type_out = type;
+    }
     return 0;
 }
 
@@ -203,20 +519,34 @@ int pyrite_matvec(int type_id, const uint8_t *data, size_t data_len,
                   const double *x, double *out, size_t rows, size_t cols) {
     size_t row_bytes = 0;
     size_t expected_bytes = 0;
-    int geometry = matrix_geometry(type_id, rows, cols, &row_bytes, &expected_bytes);
+    const pyrite_type *type = NULL;
+    int geometry = matrix_geometry(type_id, rows, cols, &row_bytes, &expected_bytes, &type);
     if (geometry != 0 || data == NULL || x == NULL || out == NULL || data_len != expected_bytes) {
         return geometry != 0 ? geometry : -3;
+    }
+    if (type->block_size == 1) {
+        /* Unquantized rows: a single flat dot product is the fastest form. */
+        for (size_t row = 0; row < rows; ++row) {
+            const uint8_t *row_data = data + row * row_bytes;
+            double sum = 0.0;
+            for (size_t col = 0; col < cols; ++col) {
+                double value;
+                type->decode(row_data + col * type->bytes_per_block, &value);
+                sum += value * x[col];
+            }
+            out[row] = sum;
+        }
+        return 0;
     }
     for (size_t row = 0; row < rows; ++row) {
         const uint8_t *row_data = data + row * row_bytes;
         double sum = 0.0;
-        if (type_id == 12) {
-            for (size_t col = 0; col < cols; col += QK_K) {
-                sum += dot_q4_k(row_data + (col / QK_K) * Q4K_BYTES, x + col);
-            }
-        } else {
-            for (size_t col = 0; col < cols; col += QK_K) {
-                sum += dot_q6_k(row_data + (col / QK_K) * Q6K_BYTES, x + col);
+        double scratch[QK_K];
+        for (size_t col = 0; col < cols; col += type->block_size) {
+            const uint8_t *block = row_data + (col / type->block_size) * type->bytes_per_block;
+            type->decode(block, scratch);
+            for (size_t l = 0; l < type->block_size; ++l) {
+                sum += scratch[l] * x[col + l];
             }
         }
         out[row] = sum;
@@ -228,7 +558,8 @@ int pyrite_dequantize_rows(int type_id, const uint8_t *data, size_t data_len,
                            double *out, size_t rows, size_t cols) {
     size_t row_bytes = 0;
     size_t expected_bytes = 0;
-    int geometry = matrix_geometry(type_id, rows, cols, &row_bytes, &expected_bytes);
+    const pyrite_type *type = NULL;
+    int geometry = matrix_geometry(type_id, rows, cols, &row_bytes, &expected_bytes, &type);
     if (geometry != 0 || data == NULL || out == NULL || data_len != expected_bytes ||
         cols > SIZE_MAX / rows) {
         return geometry != 0 ? geometry : -3;
@@ -236,12 +567,9 @@ int pyrite_dequantize_rows(int type_id, const uint8_t *data, size_t data_len,
     for (size_t row = 0; row < rows; ++row) {
         double *row_out = out + row * cols;
         const uint8_t *row_data = data + row * row_bytes;
-        for (size_t col = 0; col < cols; col += QK_K) {
-            if (type_id == 12) {
-                decode_q4_k(row_data + (col / QK_K) * Q4K_BYTES, row_out + col);
-            } else {
-                decode_q6_k(row_data + (col / QK_K) * Q6K_BYTES, row_out + col);
-            }
+        for (size_t col = 0; col < cols; col += type->block_size) {
+            type->decode(row_data + (col / type->block_size) * type->bytes_per_block,
+                         row_out + col);
         }
     }
     return 0;

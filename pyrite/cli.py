@@ -10,8 +10,9 @@ from .adapters.gguf import GGUFReader
 from .adapters.safetensors import SafetensorsAdapter
 from .config import RuntimeConfig
 from .engine import PyriteRuntime
-from .ggml_types import known_types
+from .ggml_types import known_types, row_size
 from .local import LocalModel
+from .model_profiles import PROFILE_NAMES, check_profile, profile_for
 from .storage_pages import ContentAddressedPager
 from .tensor_ops import DECODABLE_TYPES
 
@@ -67,10 +68,19 @@ def build_parser() -> argparse.ArgumentParser:
     qwen.add_argument("checkpoint")
     qwen.add_argument("--full", action="store_true", help="include the bounded streaming report")
     qwen.add_argument(
-        "--require-canonical",
-        action="store_true",
-        help="require the canonical Qwen3-MoE contract: 94 layers, 128 experts, top-8",
+        "--expect-profile",
+        choices=None,
+        metavar="NAME",
+        default=None,
+        help=(
+            "assert the checkpoint matches a published Qwen3 profile ("
+            + ", ".join(PROFILE_NAMES)
+            + "); this is a declared expectation, never a loading requirement"
+        ),
     )
+
+    plan = sub.add_parser("plan", help="report real memory requirements vs available RAM")
+    plan.add_argument("checkpoint")
 
     pages = sub.add_parser("pages", help="content-address a checkpoint into local pages")
     pages.add_argument("checkpoint")
@@ -161,6 +171,97 @@ def _streaming_budget_bytes(config: RuntimeConfig, model_config) -> int:
     small = min(32 * mib, max(1, working // 32))
     transient = min(64 * mib, max(16 * mib, working // 16))
     return max(0, working - kv_bytes - small - transient)
+
+
+def _plan_from_payload(model, config: RuntimeConfig):
+    """Recompute the :class:`MemoryPlan` object (not just its dict form)."""
+    from .memory_plan import measure_model, plan_memory
+
+    cfg = model.config
+    tensors = model.reader.tensor_index()
+    largest_row = max(
+        (row_size(tensor.dims[0], tensor.ggml_type) for tensor in tensors if tensor.dims),
+        default=0,
+    )
+    return plan_memory(
+        measure_model(
+            model.path, tensors, largest_streamed_unit=max(largest_row, 1) if largest_row else None
+        ),
+        num_layers=cfg.num_hidden_layers,
+        kv_cache_dim=2 * getattr(cfg, "num_key_value_heads", 0) * getattr(cfg, "head_dim", 0),
+        max_kv_tokens=config.max_kv_tokens,
+        working_set_bytes=config.resident_byte_budget,
+    )
+
+
+#: Human-readable names for the dense architectures qwen3-check accepts.
+_DENSE_LABELS: dict[str, str] = {"qwen3": "Qwen3 dense", "llama": "LLaMA dense"}
+
+
+def _apply_expected_profile(
+    config: object, expected: str | None, architecture: str = ""
+) -> None:
+    """Fail with a precise diff when a declared profile does not match.
+
+    The architecture is checked against the GGUF's ``general.architecture``
+    key because that is where it lives; the parsed config does not carry it for
+    every architecture.
+    """
+    if expected is None:
+        return
+    profile = profile_for(expected)
+    result = check_profile(config, profile)
+    mismatches = list(result["mismatches"])  # type: ignore[arg-type]
+    if architecture and architecture != profile.architecture:
+        mismatches.insert(
+            0,
+            {
+                "field": "general.architecture",
+                "expected": profile.architecture,
+                "actual": architecture,
+            },
+        )
+    if not mismatches:
+        return
+    details = "; ".join(
+        f"{item['field']}: expected {item['expected']!r}, found {item['actual']!r}"
+        for item in mismatches
+    )
+    raise ValueError(f"checkpoint does not match profile {expected!r}: {details}")
+
+
+def _memory_plan_payload(model, config: RuntimeConfig) -> dict[str, object]:
+    """Real memory accounting for a checkpoint, straight from the OS.
+
+    Works for any checkpoint shape: the KV width and layer count come from the
+    validated config, and the byte totals come from the parsed tensor index, so
+    a larger model reports its own numbers instead of a hardcoded guess.
+    """
+    from .memory_plan import measure_model, plan_memory
+
+    cfg = model.config
+    kv_cache_dim = 2 * getattr(cfg, "num_key_value_heads", 0) * getattr(cfg, "head_dim", 0)
+    tensors = model.reader.tensor_index()
+    largest_row = max(
+        (row_size(tensor.dims[0], tensor.ggml_type) for tensor in tensors if tensor.dims),
+        default=0,
+    )
+    footprint = measure_model(
+        model.path, tensors, largest_streamed_unit=max(largest_row, 1) if largest_row else None
+    )
+    plan = plan_memory(
+        footprint,
+        num_layers=cfg.num_hidden_layers,
+        kv_cache_dim=kv_cache_dim,
+        max_kv_tokens=config.max_kv_tokens,
+        working_set_bytes=config.resident_byte_budget,
+    )
+    return {
+        **plan.to_dict(),
+        "configured_max_kv_tokens": config.max_kv_tokens,
+        "kv_cache_dim": kv_cache_dim,
+        "requested_context_tokens": config.max_context_tokens,
+    }
 
 
 def _dense_streaming_report(model, resident_bytes: int) -> dict[str, object]:
@@ -297,11 +398,7 @@ def main(argv: list[str] | None = None) -> int:
             if architecture == MOE_ARCH:
                 model = Qwen3MoECheckpoint(args.checkpoint, reader=reader)
                 summary = model.validate_contract()
-                if args.require_canonical and not model.config.is_canonical_qwen3_moe:
-                    raise ValueError(
-                        "checkpoint does not match canonical Qwen3-MoE: expected "
-                        "94 layers, 128 experts, top-8"
-                    )
+                _apply_expected_profile(model.config, args.expect_profile, architecture)
                 payload: dict[str, object] = {
                     "model": "Qwen3-MoE",
                     "architecture": architecture,
@@ -311,13 +408,13 @@ def main(argv: list[str] | None = None) -> int:
                 if args.full:
                     stream_budget = _streaming_budget_bytes(runtime.config, model.config)
                     payload["streaming"] = model.validate_for_streaming(stream_budget)
-            elif architecture == "qwen3":
-                if args.require_canonical:
-                    raise ValueError("--require-canonical applies only to Qwen3-MoE checkpoints")
+                    payload["memory"] = _memory_plan_payload(model, runtime.config)
+            elif architecture in ("qwen3", "llama"):
                 model = DenseCheckpoint(args.checkpoint, reader=reader)
+                _apply_expected_profile(model.config, args.expect_profile, architecture)
                 summary = model.validate_contract()
                 payload = {
-                    "model": "Qwen3 dense",
+                    "model": _DENSE_LABELS.get(architecture, f"{architecture} dense"),
                     "architecture": architecture,
                     "config": model.config.to_dict(),
                     "validation": summary,
@@ -325,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
                 if args.full:
                     stream_budget = _streaming_budget_bytes(runtime.config, model.config)
                     payload["streaming"] = _dense_streaming_report(model, stream_budget)
+                    payload["memory"] = _memory_plan_payload(model, runtime.config)
             else:
                 raise ValueError(
                     f"qwen3-check requires a qwen3 or qwen3moe GGUF, got {architecture or 'unknown'}"
@@ -333,6 +431,41 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         except (OSError, ValueError, KeyError, TypeError, OverflowError, MemoryError) as exc:
             print(f"qwen3-check: {exc}", file=sys.stderr)
+            return 1
+
+    if args.command == "plan":
+        try:
+            reader = GGUFReader(Path(args.checkpoint))
+            architecture = str(reader.metadata().get("general.architecture", ""))
+            if architecture == "qwen3moe":
+                from .qwen3_moe import Qwen3MoECheckpoint
+
+                model = Qwen3MoECheckpoint(args.checkpoint, reader=reader)
+            elif architecture in ("qwen3", "llama"):
+                from .dense import DenseCheckpoint
+
+                model = DenseCheckpoint(args.checkpoint, reader=reader)
+            else:
+                raise ValueError(
+                    f"plan requires a qwen3, qwen3moe or llama GGUF, got {architecture or 'unknown'}"
+                )
+            payload = {
+                "path": str(args.checkpoint),
+                "architecture": architecture,
+                "memory": _memory_plan_payload(model, runtime.config),
+            }
+            from .memory_plan import require_plan
+
+            try:
+                require_plan(_plan_from_payload(model, runtime.config))
+                payload["runnable"] = True
+            except MemoryError as exc:
+                payload["runnable"] = False
+                payload["reason"] = str(exc)
+            _print(payload)
+            return 0
+        except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
+            print(f"plan: {exc}", file=sys.stderr)
             return 1
 
     if args.command == "inspect":

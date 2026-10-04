@@ -1,0 +1,14 @@
+tokenizer pre-tokenizer: qwen35
+vocab: 151936 tokens
+
+devanagari-marks       n=  13 IDENTICAL=True
+decomposed-accent      n=   7 IDENTICAL=True
+arabic-diacritics      n=   8 IDENTICAL=True
+thai-marks             n=   7 IDENTICAL=True
+hebrew-points          n=  15 IDENTICAL=True
+mixed-hindi-english    n=  16 IDENTICAL=True
+ascii                  n=   9 IDENTICAL=True
+digits                 n=  12 IDENTICAL=True
+punct                  n=  13 IDENTICAL=True
+
+9/9 qwen35 cases match llama.cpp exactly; every case round-trips verbatim

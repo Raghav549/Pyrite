@@ -29,6 +29,9 @@ def test_version_flag(capsys):
 
 def test_status_and_route(capsys, tmp_path: Path, monkeypatch):
     monkeypatch.setenv("PYRITE_MODEL_DIR", str(tmp_path / "store"))
+    # conftest pins PYRITE_RAM_MB so the suite does not depend on ambient RAM;
+    # this assertion is about the *shipped default*, so opt back out.
+    monkeypatch.delenv("PYRITE_RAM_MB", raising=False)
     code, payload = _run(capsys, ["status", "--json"])
     assert code == 0
     assert payload["status"]["ram_budget_mb"] == 4096
@@ -112,13 +115,38 @@ def test_generate_refuses_unsupported_quantization(capsys, tmp_path: Path, monke
     assert "without a reference decoder" in captured.err
 
 
-def test_qwen3_check_rejects_a_noncanonical_moe_when_required(capsys, tmp_path: Path, monkeypatch):
+def test_qwen3_check_accepts_a_noncanonical_moe_by_default(capsys, tmp_path: Path, monkeypatch):
+    """Nothing about Pyrite may require one published model size.
+
+    A tiny Qwen3-MoE checkpoint is a perfectly valid file; every dimension is
+    taken from the GGUF metadata, so it must validate and report its own shape.
+    """
     monkeypatch.setenv("PYRITE_MODEL_DIR", str(tmp_path / "store"))
     path, _, _ = build_tiny_checkpoint(tmp_path / "tiny.gguf")
-    code = main(["qwen3-check", str(path), "--require-canonical"])
+    code, payload = _run(capsys, ["qwen3-check", str(path)])
+    assert code == 0
+    assert payload["architecture"] == "qwen3moe"
+    assert payload["config"]["num_hidden_layers"] < 94
+
+
+def test_qwen3_check_reports_a_profile_mismatch(capsys, tmp_path: Path, monkeypatch):
+    """A declared expectation is checked, with a field-by-field diff."""
+    monkeypatch.setenv("PYRITE_MODEL_DIR", str(tmp_path / "store"))
+    path, _, _ = build_tiny_checkpoint(tmp_path / "tiny.gguf")
+    code = main(["qwen3-check", str(path), "--expect-profile", "qwen3-235b-a22b"])
     captured = capsys.readouterr()
     assert code == 1
-    assert "94 layers, 128 experts, top-8" in captured.err
+    assert "qwen3-235b-a22b" in captured.err
+    assert "num_hidden_layers" in captured.err
+
+
+def test_qwen3_check_rejects_an_unknown_profile(capsys, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("PYRITE_MODEL_DIR", str(tmp_path / "store"))
+    path, _, _ = build_tiny_checkpoint(tmp_path / "tiny.gguf")
+    code = main(["qwen3-check", str(path), "--expect-profile", "no-such-model"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "known profiles" in captured.err
 
 
 def test_qwen3_check_reports_dense_qwen3(capsys, tmp_path: Path, monkeypatch):

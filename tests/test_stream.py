@@ -19,6 +19,12 @@ def test_streamer_prefetch_and_cache(tmp_path: Path):
         with pytest.raises(KeyError):
             stream.get("missing")
 
-    assert stats.prefetched == 2
-    assert stats.loads == 2
-    assert stats.cache_hits >= 1
+    # The prefetch runs on a worker thread, so whether the first get("a") finds
+    # it already resident or loads it itself is a scheduling outcome, not a
+    # contract: pinning stats.loads made this test fail intermittently under
+    # full-suite load.  What must hold on every schedule is asserted instead.
+    assert stats.prefetched == 2, "both requested blocks must be handed to the worker"
+    assert stats.prefetch_hits == 1, "the first get must find a's prefetch"
+    assert stats.cache_hits == 1, "the second get must be served from the cache"
+    assert stats.loads >= 1
+    assert stats.bytes_loaded in (3, 6), "a, and optionally b, are the only reads"
