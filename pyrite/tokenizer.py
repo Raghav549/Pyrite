@@ -55,6 +55,20 @@ _QWEN2_PATTERN = (
     r"|\s+(?!\S)"
     r"|\s+"
 )
+# llama.cpp: LLAMA_VOCAB_PRE_TYPE_QWEN35.  Identical to QWEN2 except that
+# combining marks (\p{M}) count as letters and are excluded from the
+# punctuation run.  It is a *single* regex - src/llama-vocab.cpp:392-397 puts
+# exactly one entry in regex_exprs - so it is reproducible exactly and must not
+# be lumped in with the multi-pattern pre-tokenizers.
+_QWEN35_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
 _LLAMA_BPE_PATTERN = (
     r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
     r"|[^\r\n\p{L}\p{N}]?\p{L}+"
@@ -73,6 +87,7 @@ _PORO_PATTERN = r" ?[^\(\s|.,!?…。，、।۔،)]+"  # noqa: RUF001 - these c
 PRE_TOKENIZER_PATTERNS: dict[str, str] = {
     # llama.cpp: LLAMA_VOCAB_PRE_TYPE_QWEN2 / STABLELM2 / HUNYUAN / SOLAR_OPEN
     "qwen2": _QWEN2_PATTERN,
+    "qwen35": _QWEN35_PATTERN,
     "deepseek-r1-qwen": _QWEN2_PATTERN,
     "kormo": _QWEN2_PATTERN,
     "f2llmv2": _QWEN2_PATTERN,
@@ -110,7 +125,7 @@ PRE_TOKENIZER_PATTERNS: dict[str, str] = {
 MULTI_PATTERN_PRE_TOKENIZERS: frozenset[str] = frozenset(
     {
         "chameleon", "deepseek-coder", "deepseek-llm", "falcon", "minicpm5",
-        "default", "whitespace", "tekken", "gpt-4o", "llama4", "qwen35",
+        "default", "whitespace", "tekken", "gpt-4o", "llama4",
         "gemma4", "mellum", "mellum2", "modern-bert", "jina-v5-nano",
     }
 )

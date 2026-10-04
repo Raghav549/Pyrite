@@ -88,13 +88,17 @@ expanded from `unicodedata`, not approximated by Python's `\w`/`\d`.
 
 Pre-tokenizers that llama.cpp implements as a *sequence* of regexes
 (`default`, `chameleon`, `deepseek-coder`, `deepseek-llm`, `falcon`, `gpt-4o`,
-`llama4`, `qwen35`, `tekken` and others) raise `UnsupportedPreTokenizer` rather
-than emit plausible-looking but wrong token ids. A GGUF that omits
+`llama4`, `tekken` and others) raise `UnsupportedPreTokenizer` rather than emit
+plausible-looking but wrong token ids. `qwen35` is *not* one of them: it is a
+single regex (`src/llama-vocab.cpp:392-397`) and is implemented. A GGUF that omits
 `tokenizer.ggml.pre` is refused for the same reason llama.cpp refuses it.
 
 Verified against llama.cpp on a real 151,936-token Qwen2 vocabulary: 9/9 corpus
 cases produce byte-identical token ids, including Devanagari, mixed scripts,
-digits, punctuation and the Qwen chat control tokens.
+digits, punctuation and the Qwen chat control tokens. The `qwen35`
+pre-tokenizer is likewise 9/9 identical, including Arabic diacritics, Thai tone
+marks, Hebrew points and decomposed Latin accents - the scripts where `\p{M}`
+is the only thing that can differ.
 
 ## Validation
 

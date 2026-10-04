@@ -29,6 +29,9 @@ def test_version_flag(capsys):
 
 def test_status_and_route(capsys, tmp_path: Path, monkeypatch):
     monkeypatch.setenv("PYRITE_MODEL_DIR", str(tmp_path / "store"))
+    # conftest pins PYRITE_RAM_MB so the suite does not depend on ambient RAM;
+    # this assertion is about the *shipped default*, so opt back out.
+    monkeypatch.delenv("PYRITE_RAM_MB", raising=False)
     code, payload = _run(capsys, ["status", "--json"])
     assert code == 0
     assert payload["status"]["ram_budget_mb"] == 4096

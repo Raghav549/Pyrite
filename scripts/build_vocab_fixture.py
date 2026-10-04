@@ -130,6 +130,7 @@ def build(
     num_experts_used: int = 0,
     moe_ffn: int = 0,
     quant: str = "f32",
+    pre: str = "",
     keep_f32: tuple[str, ...] = (),
 ) -> Path:
     tokens = list(vocab["tokens"])  # type: ignore[arg-type]
@@ -218,7 +219,9 @@ def build(
         builder.add(f"{architecture}.attention.qk_norm", True)
 
     builder.add("tokenizer.ggml.model", vocab["model"])
-    builder.add("tokenizer.ggml.pre", vocab["pre"])
+    # ``--pre`` overrides the pre-tokenizer while keeping the real vocabulary,
+    # which is how a differently-tokenized sibling model is built for testing.
+    builder.add("tokenizer.ggml.pre", pre or vocab["pre"])
     builder.add("tokenizer.ggml.tokens", tokens)
     builder.add("tokenizer.ggml.merges", list(vocab["merges"]))  # type: ignore[arg-type]
     builder.add("tokenizer.ggml.token_type", list(vocab["token_types"]), INT32)
@@ -301,6 +304,11 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="comma-separated tensor-name prefixes to leave in F32",
     )
+    parser.add_argument(
+        "--pre",
+        default="",
+        help="override tokenizer.ggml.pre (e.g. qwen35) while keeping the real vocab",
+    )
     args = parser.parse_args(argv)
 
     vocab = load_real_vocab(args.vocab_gguf)
@@ -320,12 +328,14 @@ def main(argv: list[str] | None = None) -> int:
         num_experts_used=args.experts_used,
         moe_ffn=args.moe_ffn,
         quant=args.quant,
+        pre=args.pre,
         keep_f32=tuple(args.keep_f32.split(",")) if args.keep_f32 else (),
     )
     print(
         f"wrote {path} ({path.stat().st_size:,} bytes) arch={args.architecture} "
         f"vocab={len(vocab['tokens'])} pre={vocab['pre']!r} "
-        f"layers={args.num_layers} hidden={args.hidden_size} quant={args.quant}"
+        f"layers={args.num_layers} hidden={args.hidden_size} quant={args.quant} "
+        f"pre='{args.pre or vocab['pre']}'"
     )
     return 0
 

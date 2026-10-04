@@ -59,10 +59,18 @@ cmake --build build -j2 --target llama-tokenize llama-completion
 
 ```
 $ python3 -m pytest -q
-345 passed in 19.73s
+353 passed in 51.14s
 ```
 
-The baseline before this round of work was **249 passed**; 96 tests were added.
+The baseline before this round of work was **249 passed**; 104 tests were added.
+Three consecutive full runs gave 353/353/353 - the suite is deterministic, which
+it previously was not. The shipped resident budget (4096 MiB - 768 MiB reserve
+= 3328 MiB) is compared against *currently available* RAM by the PHASE 7 gate,
+and on this 3939 MiB machine that comparison fails whenever ambient use pushes
+available below 3328 MiB - observed at 3199.1 and 3248.0 MiB, and passing again
+at 3583.7 MiB. `tests/conftest.py` now pins `PYRITE_RAM_MB` for every test so
+no test depends on whatever else is resident; `test_status_and_route` opts out
+with `monkeypatch.delenv` because it asserts the shipped default.
 No test is skipped: the checkpoint-shape tests build their fixtures themselves
 rather than reading files that are not in the repository.
 
@@ -100,11 +108,21 @@ tokens are matched verbatim rather than split.
 
 ## Generation vs llama.cpp
 
-No published Qwen3 GGUF could be obtained in this environment (Hugging Face and
-every mirror are unreachable here; Git LFS media and the GitHub releases CDN are
-blocked, and no Qwen3 quant fits in GitHub's 100 MB non-LFS limit). So a
-reference checkpoint was built locally instead: real Qwen3 tensor layout, real
-Qwen2 vocabulary (151,936 tokens), F32 weights, random values.
+**No published Qwen3 GGUF could be obtained in this environment.** This was
+re-checked rather than assumed, and each route fails for a specific reason:
+
+| route | result |
+| --- | --- |
+| `huggingface.co` LFS batch API | `000` - host unreachable |
+| GitHub LFS batch API (`github.com/<repo>.git/info/lfs/objects/batch`) | `403 "Resource not accessible by integration"` - the sandbox token has no LFS scope |
+| Real Qwen3 GGUF stored as a plain GitHub blob | impossible: `lev73748/qwen3-0.6b-russian-dialogues` stores its Q4_K_M as a **134-byte LFS pointer** declaring `size 396700768`, and GitHub caps plain blobs at 100 MB |
+| npm registry (`-/v1/search?text=qwen3+gguf`) | parsers and tokenizers only, no model files |
+| vendored copies in third-party repos | llama.cpp's `ggml-vocab-*.gguf` vocab files, which are the real thing but carry no weights |
+
+So a reference checkpoint was built locally instead: real Qwen3 tensor layout,
+real Qwen2 vocabulary (151,936 tokens), weights generated here. Everything
+below that says "identical to llama.cpp" is a comparison of two runtimes on the
+same file, not a claim about a released checkpoint.
 
 ```
 $ python3 scripts/build_vocab_fixture.py --vocab-gguf models/ggml-vocab-qwen2.gguf \
@@ -283,13 +301,78 @@ Note that `pyrite bench` benchmarks *route planning* (16 plans in 0.66 ms), not
 inference. The inference numbers above come from the direct measurement, which
 is the script reproduced in `validation/benchmark-qwen3-0p6b-shape.txt`.
 
+## The qwen35 pre-tokenizer
+
+`tokenizer.ggml.pre = qwen35` was being refused as a multi-regex
+pre-tokenizer. Reading `src/llama-vocab.cpp:392-397` shows it is a single
+regex, identical to qwen2 except that combining marks (`\p{M}`) count as
+letters and are excluded from the punctuation run. It is now implemented.
+
+The difference is visible directly:
+
+```
+qwen2  ("नमस्ते cafe\u0301 hi") -> ['नमस', '्त', 'े', ' cafe', '\u0301', ' hi']
+qwen35 ("नमस्ते cafe\u0301 hi") -> ['नमस्ते', ' cafe\u0301', ' hi']
+```
+
+Verified against `llama-tokenize` on a fixture built with the real
+151,936-token vocabulary and `pre` overridden to `qwen35`
+(`scripts/build_vocab_fixture.py --pre qwen35`) - **9/9 identical**, and every
+case round-trips verbatim. The cases were chosen so that combining marks are
+the only thing that can differ: Devanagari, Arabic diacritics, Thai tone marks,
+Hebrew points, decomposed Latin accents, plus ASCII/digit/punctuation controls.
+
+```
+devanagari-marks       n=  13 IDENTICAL=True
+decomposed-accent      n=   7 IDENTICAL=True
+arabic-diacritics      n=   8 IDENTICAL=True
+thai-marks             n=   7 IDENTICAL=True
+hebrew-points          n=  15 IDENTICAL=True
+mixed-hindi-english    n=  16 IDENTICAL=True
+ascii                  n=   9 IDENTICAL=True
+digits                 n=  12 IDENTICAL=True
+punct                  n=  13 IDENTICAL=True
+```
+
+`validation/qwen35-pretokenizer-crosscheck.txt`; pinned by three tests in
+`tests/test_tokenizer.py`.
+
+## Published head geometry: head_dim 128 at hidden 1024
+
+Every published dense Qwen3 uses `head_dim = 128`, which for the smaller sizes
+is *not* `hidden_size / num_attention_heads`. Qwen3-0.6B is the sharp case:
+1024 over 16 heads is 64, but the real head dimension is 128. An engine that
+defaulted `head_dim` to `hidden / heads` would build the wrong attention shapes
+and still appear to work on a toy model.
+
+`tests/test_published_head_geometry.py` builds the published geometry (hidden
+1024, 16 heads, 8 KV heads, head_dim 128, FFN 3072) and asserts all five of:
+
+* `attn_q.weight` is `(1024, 2048)`, `attn_k`/`attn_v` `(1024, 1024)`,
+  `attn_output.weight` `(2048, 1024)`, and the QK-norm vectors are 128 long;
+* the metadata genuinely disagrees with `hidden / heads` (128 vs 64), so the
+  naive default would be wrong;
+* metadata claiming `key_length = 128` over tensors built for 64 raises
+  `DenseContractError` naming both shapes;
+* a *missing* `attention.key_length` infers `hidden / heads` **and that
+  inference is still shape-checked**, so a real 128-head checkpoint is rejected
+  rather than silently mis-shaped;
+* the 128-dim head path generates end to end, deterministically, including
+  per-head QK-norm.
+
+The shape validation itself already existed at `pyrite/dense.py:396-399`; what
+was missing was proof that it holds at the published dimensions.
+
 ## Known limitations
 
 - **Multi-regex pre-tokenizers are refused, not approximated.** `chameleon`,
-  `deepseek-coder`, `deepseek-llm`, `falcon`, `gpt-4o`, `llama4`, `qwen35`,
-  `tekken`, `default` and others apply a *sequence* of regexes in llama.cpp.
-  Pyrite raises `UnsupportedPreTokenizer` rather than emit plausible-but-wrong
-  ids. Supported: the qwen2, llama3/llama-bpe, gpt-2 and poro/bloom families.
+  `deepseek-coder`, `deepseek-llm`, `falcon`, `gpt-4o`, `llama4`, `tekken`,
+  `default` and others apply a *sequence* of regexes in llama.cpp. Pyrite
+  raises `UnsupportedPreTokenizer` rather than emit plausible-but-wrong ids.
+  Supported: the qwen2, **qwen35**, llama3/llama-bpe, gpt-2 and poro/bloom
+  families. `qwen35` was wrongly listed as multi-regex earlier -
+  `src/llama-vocab.cpp:392-397` puts exactly *one* entry in `regex_exprs` for
+  it - and is now implemented; see the qwen35 section below.
 - **A GGUF with no `tokenizer.ggml.pre` is refused.** llama.cpp throws for an
   unknown pre-tokenizer for the same reason.
 - **`_apply_merges` is O(n^2)** in the number of symbols in a piece
@@ -361,6 +444,7 @@ python3 scripts/build_vocab_fixture.py --vocab-gguf models/ggml-vocab-qwen2.gguf
 | --- | --- |
 | `validation/generation-qwen3-vocab.json` | Pyrite generation on the real-vocab Qwen3 fixture. |
 | `validation/quantized-crosscheck.txt` | Q8_0 / Q4_0 greedy generation vs llama.cpp: 4/4 identical. |
+| `validation/qwen35-pretokenizer-crosscheck.txt` | qwen35 pre-tokenizer vs llama.cpp: 9/9 identical. |
 | `validation/pyrite-generation.txt` | Pyrite's completion text. |
 | `validation/llama-cpp-generation.txt` | llama.cpp's completion text, same prompt. |
 | `validation/benchmark-qwen3-0p6b-shape.txt` | The benchmark above. |

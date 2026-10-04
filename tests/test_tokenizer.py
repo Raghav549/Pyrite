@@ -173,3 +173,55 @@ def test_whitespace_tokenizer_is_reproducible():
     assert first == second
     assert len(first) == 3
     assert WhitespaceTokenizer().encode("") == []
+
+
+# --------------------------------------------------------------------------
+# qwen35: llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN35 (src/llama-vocab.cpp:392).
+#
+# It is a *single* regex - the case block puts exactly one entry in
+# regex_exprs - identical to qwen2 except that combining marks (\p{M}) count
+# as letters and are excluded from the punctuation run.  It used to be listed
+# with the multi-pattern pre-tokenizers and refused; these tests pin the
+# behaviour that replaced that refusal.  Verified against ``llama-tokenize``
+# 9/9 on the real 151,936-token vocabulary, including Devanagari, Arabic,
+# Thai, Hebrew and decomposed Latin accents
+# (validation/qwen35-pretokenizer-crosscheck.txt).
+# --------------------------------------------------------------------------
+
+
+def test_qwen35_is_a_single_pattern_pre_tokenizer():
+    from pyrite.tokenizer import MULTI_PATTERN_PRE_TOKENIZERS, PRE_TOKENIZER_PATTERNS
+
+    assert "qwen35" in PRE_TOKENIZER_PATTERNS
+    assert "qwen35" not in MULTI_PATTERN_PRE_TOKENIZERS
+    # Does not raise UnsupportedPreTokenizer.
+    assert pre_tokenizer_for("qwen35") is not None
+
+
+def test_qwen35_differs_from_qwen2_exactly_on_combining_marks():
+    """The whole point of the separate pattern: marks join their base letter."""
+    qwen2 = pre_tokenizer_for("qwen2")
+    qwen35 = pre_tokenizer_for("qwen35")
+
+    devanagari = "नमस्ते"  # नमस्ते: base letters + virama/vowel signs (Mn)
+    assert qwen2.findall(devanagari) == ["नमस", "्त", "े"]
+    assert qwen35.findall(devanagari) == ["नमस्ते"]
+
+    decomposed = "cafe\u0301"  # cafe + COMBINING ACUTE ACCENT
+    assert qwen2.findall(decomposed) == ["cafe", "\u0301"]
+    assert qwen35.findall(decomposed) == ["cafe\u0301"]
+
+
+def test_qwen35_is_identical_to_qwen2_when_there_are_no_marks():
+    """No behavioural drift on the text the two patterns agree about."""
+    qwen2 = pre_tokenizer_for("qwen2")
+    qwen35 = pre_tokenizer_for("qwen35")
+    for text in (
+        "ab 12\n",
+        "Explain Pyrite in one short paragraph.",
+        "Hello, world! (again) [x] {y}",
+        "12345 678 90",
+        "don't stop",
+        "\r\n\r\n  spaced  ",
+    ):
+        assert qwen35.findall(text) == qwen2.findall(text), text
